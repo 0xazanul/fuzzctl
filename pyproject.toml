@@ -1,0 +1,12 @@
+[project]
+name = "fuzz-pipeline"
+version = "0.1.0"
+description = "Python orchestration for critical C/C++ memory-bug fuzzing"
+requires-python = ">=3.12"
+
+[project.scripts]
+fuzzctl = "fuzz_pipeline.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+

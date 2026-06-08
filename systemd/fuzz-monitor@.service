@@ -1,0 +1,17 @@
+[Unit]
+Description=Fuzz Pipeline monitor for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/azanul/fuzz-pipeline
+EnvironmentFile=-/home/azanul/.config/fuzz-pipeline/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/azanul/fuzz-pipeline/bin/fuzzctl --runtime native monitor %i --interval 60
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

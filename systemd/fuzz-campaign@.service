@@ -1,0 +1,20 @@
+[Unit]
+Description=Fuzz Pipeline AFL++ campaign for %i
+After=network-online.target
+Wants=network-online.target
+Wants=fuzz-monitor@%i.service
+After=fuzz-monitor@%i.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/azanul/fuzz-pipeline
+EnvironmentFile=-/home/azanul/.config/fuzz-pipeline/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/azanul/fuzz-pipeline/bin/fuzzctl --runtime native supervisor campaign-loop %i --engine aflpp --hours 24 --workers 8 --wait-interval 60
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=90
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Fuzz Pipeline dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/azanul/fuzz-pipeline
+EnvironmentFile=-/home/azanul/.config/fuzz-pipeline/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/azanul/fuzz-pipeline/bin/fuzzctl --runtime native dashboard --host 127.0.0.1 --port 8088
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

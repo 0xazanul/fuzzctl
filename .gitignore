@@ -1,0 +1,54 @@
+# Python/runtime caches.
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+
+# Local secrets and environment files. Keep only the safe template.
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+secrets/
+
+# Per-machine fuzzing data. Do not push target repos, manifests, corpora,
+# work orders, crashes, minimized reproducers, coverage, or monitor state.
+build/
+corpora/
+fixtures/
+repos/
+runs/
+state/
+targets/
+workorders/
+
+# Coverage and sanitizer artifacts that may also appear outside run dirs.
+*.profraw
+*.profdata
+coverage_html/
+*.sancov
+*.symcov
+core
+core.*
+
+# Local logs and temporary files.
+*.log
+*.tmp
+*.swp
+*.swo
+fuzz-dashboard-*.png
+
+# Editor/OS noise.
+.DS_Store
+.idea/
+.vscode/
