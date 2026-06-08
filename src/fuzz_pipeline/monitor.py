@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .alerts import AlertEvent, send_discord, webhook_url
+from .findings import duplicate_count, normalize_crash_item
 from .manifest import TargetManifest
 from .triage import _crash_files, triage_run
 from .util import ensure_dir, find_latest_run, free_disk_bytes, human_bytes, read_json, rel_to, write_json
@@ -29,6 +30,8 @@ def _load_state(path: Path) -> dict[str, Any]:
         "last_paths": 0,
         "last_raw_crashes": 0,
         "last_unique_crashes": 0,
+        "last_duplicate_crashes": 0,
+        "last_triaged_raw_crashes": 0,
         "last_raw_alert_at": 0,
         "last_reproducible_alerts": [],
         "stall_count": 0
@@ -39,7 +42,7 @@ def _unique_crashes(run_dir: Path) -> list[dict[str, Any]]:
     path = run_dir / "triage" / "unique_crashes.json"
     if not path.exists():
         return []
-    return list(read_json(path).get("crashes", []))
+    return [normalize_crash_item(item) for item in read_json(path).get("crashes", [])]
 
 
 def _alive_afl_workers(run_dir: Path) -> int:
@@ -109,6 +112,10 @@ def _snapshot(workspace: Path, run_dir: Path) -> dict[str, Any]:
             harness = "unknown"
         queue_by_harness[harness] = queue_by_harness.get(harness, 0) + 1
 
+    unique_crashes = _unique_crashes(run_dir)
+    duplicate_crashes = sum(duplicate_count(item) for item in unique_crashes)
+    triaged_raw_crashes = len(unique_crashes) + duplicate_crashes
+
     return {
         "run": str(run_dir),
         "active": active,
@@ -119,7 +126,10 @@ def _snapshot(workspace: Path, run_dir: Path) -> dict[str, Any]:
         "afl_saved_hangs": hangs,
         "raw_crashes": len(raw_crashes),
         "raw_crash_files": [rel_to(p, workspace) for p in raw_crashes[-10:]],
-        "unique_crashes": _unique_crashes(run_dir),
+        "unique_crashes": unique_crashes,
+        "unique_crash_count": len(unique_crashes),
+        "duplicate_crashes": duplicate_crashes,
+        "triaged_raw_crashes": triaged_raw_crashes,
         "workers_expected": len(stats_files),
         "workers_alive": _alive_afl_workers(run_dir),
         "stale_stats": stale_stats,
@@ -139,20 +149,59 @@ def _raw_crash_events(workspace: Path, run_dir: Path, snapshot: dict[str, Any], 
     alerted = set(state.get("alerted_keys", []))
     if key in alerted:
         return []
+    unique_known = "unique_crash_count" in snapshot or "unique_crashes" in snapshot
+    unique_count = int(snapshot.get("unique_crash_count", len(snapshot.get("unique_crashes", []))) or 0)
+    previous_unique = int(state.get("last_unique_crashes", 0) or 0)
+    duplicate_count_now = int(snapshot.get("duplicate_crashes", 0) or 0)
+    previous_duplicates = int(state.get("last_duplicate_crashes", 0) or 0)
+    duplicate_only = unique_known and unique_count <= previous_unique and duplicate_count_now > previous_duplicates
+    severity = "INFO" if duplicate_only else "HIGH"
+    title = "duplicate raw fuzz crash observed" if duplicate_only else "raw fuzz crash observed"
+    description = (
+        "A new crash artifact collapsed into an already-known sanitizer state for this run."
+        if duplicate_only
+        else "A crash artifact appeared. Triage will confirm whether it is sanitizer-reproducible and security-relevant."
+    )
     return [
         AlertEvent(
             key=key,
-            title="raw fuzz crash observed",
-            description="A crash artifact appeared. Triage will confirm whether it is sanitizer-reproducible and security-relevant.",
-            severity="HIGH",
+            title=title,
+            description=description,
+            severity=severity,
             fields={
                 "run": rel_to(run_dir, workspace),
                 "raw_crashes": raw_count,
                 "previous_raw_crashes": previous,
+                "unique_crashes": unique_count,
+                "duplicate_crashes": duplicate_count_now,
                 "recent_files": "\n".join(snapshot.get("raw_crash_files", [])[-5:]) or "none",
             },
         )
     ]
+
+
+def _previous_crash_runs(workspace: Path, run_dir: Path, crash: dict[str, Any]) -> list[str]:
+    target = run_dir.parent.name
+    crash_id = str(crash.get("id") or "")
+    state = str(crash.get("state") or "")
+    previous: list[str] = []
+    for triage_path in sorted((workspace / "runs" / target).glob("*/triage/unique_crashes.json")):
+        other_run = triage_path.parents[1]
+        if other_run == run_dir:
+            continue
+        try:
+            data = read_json(triage_path)
+        except Exception:
+            continue
+        for item in data.get("crashes", []):
+            if not item.get("reproducible", False):
+                continue
+            same_id = crash_id and str(item.get("id") or "") == crash_id
+            same_state = state and str(item.get("state") or "") == state
+            if same_id or same_state:
+                previous.append(other_run.name)
+                break
+    return previous[-5:]
 
 
 def _events(workspace: Path, run_dir: Path, snapshot: dict[str, Any], state: dict[str, Any]) -> list[AlertEvent]:
@@ -165,16 +214,32 @@ def _events(workspace: Path, run_dir: Path, snapshot: dict[str, Any], state: dic
         if key in alerted:
             continue
         severity = str(crash.get("severity", "INFO"))
+        previous_runs = _previous_crash_runs(workspace, run_dir, crash)
+        known_duplicate = bool(previous_runs)
+        event_severity = "INFO" if known_duplicate else severity
+        title = (
+            f"known duplicate fuzz crash: {crash.get('type', 'unknown')}"
+            if known_duplicate
+            else f"{severity} fuzz crash: {crash.get('type', 'unknown')}"
+        )
+        description = (
+            "This sanitizer state already exists in an earlier run, so it is tracked as a duplicate occurrence."
+            if known_duplicate
+            else str(crash.get("impact", "New reproducible fuzz crash."))
+        )
         events.append(
             AlertEvent(
                 key=key,
-                title=f"{severity} fuzz crash: {crash.get('type', 'unknown')}",
-                description=str(crash.get("impact", "New reproducible fuzz crash.")),
-                severity=severity,
+                title=title,
+                description=description,
+                severity=event_severity,
                 fields={
                     "run": rel_to(run_dir, workspace),
                     "harness": crash.get("harness"),
                     "id": crash.get("id"),
+                    "duplicate_of_runs": "\n".join(previous_runs) if previous_runs else "none",
+                    "raw_artifacts": crash.get("raw_artifacts", 1),
+                    "duplicates": crash.get("duplicates", 0),
                     "minimized": rel_to(Path(crash["minimized_path"]), workspace) if crash.get("minimized_path") else "not minimized yet"
                 }
             )
@@ -264,7 +329,11 @@ def monitor_once(
     alerted = set(state.get("alerted_keys", []))
 
     pre_snapshot = _snapshot(workspace, run_dir)
-    raw_events = _raw_crash_events(workspace, run_dir, pre_snapshot, state)
+    if triage and pre_snapshot["raw_crashes"]:
+        triage_run(workspace, manifest, run_dir.name)
+
+    snapshot = _snapshot(workspace, run_dir)
+    raw_events = _raw_crash_events(workspace, run_dir, snapshot, state)
     for event in raw_events:
         if not no_alerts and webhook_url(webhook):
             send_discord(event, url=webhook)
@@ -274,10 +343,6 @@ def monitor_once(
         state["last_raw_alert_at"] = int(time.time())
         print(f"event: {event.severity} {event.title} [{event.key}]")
 
-    if triage and pre_snapshot["raw_crashes"]:
-        triage_run(workspace, manifest, run_dir.name)
-
-    snapshot = _snapshot(workspace, run_dir)
     events = _events(workspace, run_dir, snapshot, state)
     for event in events:
         if not no_alerts and webhook_url(webhook):
@@ -291,7 +356,9 @@ def monitor_once(
     state["last_execs"] = snapshot["execs"]
     state["last_paths"] = snapshot["paths"]
     state["last_raw_crashes"] = snapshot["raw_crashes"]
-    state["last_unique_crashes"] = len(snapshot["unique_crashes"])
+    state["last_unique_crashes"] = snapshot.get("unique_crash_count", len(snapshot["unique_crashes"]))
+    state["last_duplicate_crashes"] = snapshot.get("duplicate_crashes", 0)
+    state["last_triaged_raw_crashes"] = snapshot.get("triaged_raw_crashes", 0)
     state["last_reproducible_alerts"] = [
         crash.get("id") for crash in snapshot["unique_crashes"] if crash.get("reproducible", False)
     ]
@@ -301,7 +368,8 @@ def monitor_once(
 
     print(
         f"monitor {rel_to(run_dir, workspace)}: execs={snapshot['execs']} paths={snapshot['paths']} "
-        f"raw_crashes={snapshot['raw_crashes']} unique={len(snapshot['unique_crashes'])} "
+        f"raw_crashes={snapshot['raw_crashes']} unique={snapshot.get('unique_crash_count', len(snapshot['unique_crashes']))} "
+        f"duplicates={snapshot.get('duplicate_crashes', 0)} "
         f"disk={human_bytes(snapshot['disk_free'])}"
     )
     return snapshot

@@ -104,7 +104,17 @@ def _build_raw_harnesses(workspace: Path, manifest: TargetManifest, profile: str
         binary = harness_binary(workspace, manifest, profile, harness)
         compiler = _compiler_for(profile, manifest.language, source)
         context_flags, link_args = context_flags_for_source(workspace, manifest, source)
-        cmd = [compiler, *_profile_flags(profile, harness), *context_flags, str(source), *link_args, "-o", str(binary)]
+        cmd = [
+            compiler,
+            *_profile_flags(profile, harness),
+            *context_flags,
+            *harness.compile_flags,
+            str(source),
+            *link_args,
+            *harness.link_flags,
+            "-o",
+            str(binary),
+        ]
         result = run_cmd(cmd, cwd=source_dir, env=_profile_env(profile), print_cmd=True)
         (out_dir / f"{harness.name}.build.log").write_text(result.output, encoding="utf-8")
         if result.returncode != 0:

@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
+import signal
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from .campaign import run_campaign
+from .campaign import _harnesses, _worker_counts, run_campaign, smoke
 from .corpus import corpus_sync
 from .coverage import coverage_run
 from .manifest import TargetManifest
 from .reporting import report_run
 from .triage import minimize_run, triage_run
-from .util import ensure_dir, free_disk_bytes, human_bytes, read_json, write_json
+from .util import cpu_default_workers, ensure_dir, free_disk_bytes, human_bytes, read_json, write_json
 
 
 def _classify_cmdline(args: list[str], workspace: Path, target: str) -> str | None:
@@ -52,8 +54,94 @@ def active_fuzz_processes(workspace: Path, target: str) -> list[dict[str, object
         args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
         kind = _classify_cmdline(args, workspace, target)
         if kind:
-            processes.append({"pid": pid, "kind": kind, "cmd": " ".join(args)})
+            item: dict[str, object] = {"pid": pid, "kind": kind, "cmd": " ".join(args)}
+            run_match = re.search(rf"/runs/{re.escape(target)}/([^/\s]+)/", item["cmd"])
+            if run_match:
+                item["run_id"] = run_match.group(1)
+            harness_match = re.search(rf"/runs/{re.escape(target)}/[^/\s]+/aflpp/([^/\s]+)/findings", item["cmd"])
+            if harness_match:
+                item["harness"] = harness_match.group(1)
+            processes.append(item)
     return sorted(processes, key=lambda item: int(item["pid"]))
+
+
+def _expected_afl_worker_counts(manifest: TargetManifest, workers: int | None) -> dict[str, int]:
+    file_harnesses = _harnesses(manifest, "file")
+    if not file_harnesses:
+        return {}
+    return _worker_counts(file_harnesses, workers or cpu_default_workers())
+
+
+def _active_afl_worker_counts(active: list[dict[str, object]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for proc in active:
+        if proc.get("kind") != "afl-fuzz":
+            continue
+        harness = proc.get("harness")
+        if not harness:
+            continue
+        counts[str(harness)] = counts.get(str(harness), 0) + 1
+    return counts
+
+
+def _campaign_mismatch_reason(
+    active: list[dict[str, object]],
+    manifest: TargetManifest,
+    *,
+    engine: str,
+    workers: int | None,
+) -> str | None:
+    if engine not in {"aflpp", "all"}:
+        return None
+    expected = _expected_afl_worker_counts(manifest, workers)
+    if not expected:
+        return None
+    observed = _active_afl_worker_counts(active)
+    if not observed:
+        return None
+    if observed != expected:
+        return f"active AFL++ worker plan {observed} does not match expected {expected}"
+    return None
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_processes(active: list[dict[str, object]], *, timeout: int) -> dict[str, object]:
+    fuzzctl = [int(proc["pid"]) for proc in active if proc.get("kind") == "fuzzctl-run"]
+    afl = [int(proc["pid"]) for proc in active if proc.get("kind") == "afl-fuzz"]
+    signaled: list[int] = []
+    forced: list[int] = []
+
+    for pid in [*fuzzctl, *afl]:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            signaled.append(pid)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(_process_alive(pid) for pid in [*fuzzctl, *afl]):
+            break
+        time.sleep(1)
+
+    for pid in [*fuzzctl, *afl]:
+        if not _process_alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            forced.append(pid)
+        except ProcessLookupError:
+            pass
+    return {"signaled": signaled, "forced": forced}
 
 
 @contextmanager
@@ -125,6 +213,9 @@ def campaign_loop(
     max_cycles: int | None = None,
     post_cycle: bool = True,
     coverage_inputs: int = 5000,
+    replace_mismatched: bool = False,
+    replace_timeout: int = 90,
+    leak_smoke_seconds: int = 0,
 ) -> int:
     target = manifest.name
     with _target_lock(workspace, target) as locked:
@@ -135,11 +226,37 @@ def campaign_loop(
         while max_cycles is None or cycle < max_cycles:
             active = active_fuzz_processes(workspace, target)
             if active:
+                mismatch = _campaign_mismatch_reason(active, manifest, engine=engine, workers=workers)
+                if mismatch and replace_mismatched:
+                    _write_state(
+                        workspace,
+                        target,
+                        {
+                            "status": "replacing_mismatched_campaign",
+                            "reason": mismatch,
+                            "active_processes": active,
+                            "replace_timeout": replace_timeout,
+                        },
+                    )
+                    print(f"{target}: replacing mismatched fuzzing: {mismatch}")
+                    termination = _terminate_processes(active, timeout=replace_timeout)
+                    _write_state(
+                        workspace,
+                        target,
+                        {
+                            "status": "mismatched_campaign_replaced",
+                            "reason": mismatch,
+                            "termination": termination,
+                        },
+                    )
+                    time.sleep(2)
+                    continue
                 _write_state(
                     workspace,
                     target,
                     {
                         "status": "waiting_existing_campaign",
+                        "reason": mismatch,
                         "active_processes": active,
                         "next_check_seconds": wait_interval,
                     },
@@ -149,6 +266,35 @@ def campaign_loop(
                 continue
 
             cycle += 1
+            leak_run_ids: list[str] = []
+            if leak_smoke_seconds > 0:
+                _write_state(
+                    workspace,
+                    target,
+                    {
+                        "status": "running_leak_smoke",
+                        "cycle": cycle,
+                        "seconds_per_harness": leak_smoke_seconds,
+                    },
+                )
+                leak_run = smoke(workspace, manifest, leak_smoke_seconds, leak_check=True)
+                leak_run_ids.append(leak_run.name)
+                try:
+                    triage_run(workspace, manifest, leak_run.name)
+                    minimize_run(workspace, manifest, leak_run.name)
+                    report_run(workspace, manifest, leak_run.name)
+                except Exception as exc:
+                    _write_state(
+                        workspace,
+                        target,
+                        {
+                            "status": "leak_smoke_error",
+                            "cycle": cycle,
+                            "run_id": leak_run.name,
+                            "error": str(exc),
+                        },
+                    )
+                    raise
             _write_state(
                 workspace,
                 target,
@@ -158,6 +304,7 @@ def campaign_loop(
                     "engine": engine,
                     "hours": hours,
                     "workers": workers,
+                    "leak_smoke_run_ids": leak_run_ids,
                 },
             )
             run_dirs = run_campaign(workspace, manifest, engine, hours, workers)
@@ -169,6 +316,7 @@ def campaign_loop(
                     "status": "post_cycle" if post_cycle else "cycle_complete",
                     "cycle": cycle,
                     "run_ids": run_ids,
+                    "leak_smoke_run_ids": leak_run_ids,
                 },
             )
             if post_cycle:
@@ -199,6 +347,7 @@ def campaign_loop(
                     "status": "cycle_complete",
                     "cycle": cycle,
                     "run_ids": run_ids,
+                    "leak_smoke_run_ids": leak_run_ids,
                     "disk_free": human_bytes(free_disk_bytes(workspace)),
                 },
             )

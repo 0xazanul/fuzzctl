@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .findings import crash_artifact_count, duplicate_count
 from .manifest import TargetManifest
 from .triage import minimize_run, triage_run
 from .util import ensure_dir, find_latest_run, rel_to
@@ -32,11 +33,23 @@ def report_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
     crashes = data.get("crashes", [])
     if not crashes:
         index_lines.append("No crashes were found.")
+    else:
+        raw_artifacts = int(data.get("raw_crashes", 0) or sum(crash_artifact_count(item) for item in crashes))
+        duplicates = int(data.get("duplicate_crashes", 0) or sum(duplicate_count(item) for item in crashes))
+        index_lines.extend(
+            [
+                f"Raw crash artifacts: `{raw_artifacts}`",
+                f"Unique sanitizer states: `{len(crashes)}`",
+                f"Duplicate artifacts collapsed: `{duplicates}`",
+                "",
+            ]
+        )
     for item in crashes:
         title = f"{item['severity']} {item['type']} in {item['harness']} ({item['id']})"
         report_path = out / f"{item['id']}.md"
         trace = _read_trace(item.get("trace_path", ""))
         cmd = " ".join(item.get("repro_cmd", []))
+        artifacts = crash_artifact_count(item)
         body = [
             f"# {title}",
             "",
@@ -45,6 +58,7 @@ def report_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
             f"Access: `{item.get('access', 'unknown')}`",
             f"Harness: `{item['harness']}`",
             f"Duplicates: `{item.get('duplicates', 0)}`",
+            f"Raw artifacts represented: `{artifacts}`",
             "",
             "## Impact",
             "",
@@ -86,4 +100,3 @@ def report_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
     index.write_text("\n".join(index_lines) + "\n", encoding="utf-8")
     print(f"reports: {rel_to(out, workspace)}")
     return out
-

@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .detect import detect_target
+from .findings import normalize_crash_item, severity_value, target_findings
 from .launch import launch_repo
 from .manifest import load_manifest
 from .monitor import _snapshot, monitor_once
@@ -190,45 +191,7 @@ def _target_hidden(data: dict) -> tuple[bool, str]:
 
 
 def _target_findings(workspace: Path, target: str) -> dict:
-    target_runs = workspace / "runs" / target
-    findings: list[dict] = []
-    if not target_runs.exists():
-        return {"total": 0, "reproducible": 0, "high_or_critical": 0, "findings": []}
-    for triage_path in sorted(target_runs.glob("*/triage/unique_crashes.json")):
-        try:
-            data = read_json(triage_path)
-        except Exception:
-            continue
-        run_dir = triage_path.parents[1]
-        for crash in data.get("crashes", []):
-            item = dict(crash)
-            item["run_id"] = run_dir.name
-            item["run_path"] = rel_to(run_dir, workspace)
-            report_path = run_dir / "reports" / f"{item.get('id')}.md"
-            if report_path.exists():
-                item["report"] = rel_to(report_path, workspace)
-            findings.append(item)
-    triaged_count = len(findings)
-    reproducible = [item for item in findings if item.get("reproducible")]
-    high_or_critical = [
-        item for item in reproducible
-        if str(item.get("severity", "")).upper() in {"HIGH", "CRITICAL"}
-    ]
-    severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
-    reproducible.sort(
-        key=lambda item: (
-            severity_rank.get(str(item.get("severity", "")).upper(), -1),
-            str(item.get("run_id", "")),
-        ),
-        reverse=True,
-    )
-    return {
-        "total": len(reproducible),
-        "triaged": triaged_count,
-        "reproducible": len(reproducible),
-        "high_or_critical": len(high_or_critical),
-        "findings": reproducible,
-    }
+    return target_findings(workspace, target)
 
 
 def _targets(workspace: Path) -> tuple[list[dict], list[dict]]:
@@ -450,12 +413,15 @@ def render_home(workspace: Path) -> bytes:
         link = f"<a href='/target/{target_name}' class='target-name'>{target_name}</a>"
         run = f"<a href='/run/{target_name}/{html.escape(latest)}'>{html.escape(latest)}</a>" if latest else "<span class='muted'>no runs</span>"
         harnesses = len(t.get("manifest", {}).get("harnesses", []))
-        confirmed = int((t.get("findings") or {}).get("reproducible", 0) or 0)
+        target_findings_data = t.get("findings") or {}
+        confirmed = int(target_findings_data.get("reproducible", 0) or 0)
+        collapsed = int(target_findings_data.get("duplicate_artifacts", 0) or 0)
         finding_label = "finding" if confirmed == 1 else "findings"
+        duplicate_note = f", {collapsed} duplicate artifacts collapsed" if collapsed else ""
         target_cards.append(
             "<div class='item target-item'>"
-            f"<div>{link}<div class='target-meta'>{harnesses} harnesses, latest {run}</div></div>"
-            f"{badge(f'{confirmed} {finding_label}', 'bad' if confirmed else 'info')}"
+            f"<div>{link}<div class='target-meta'>{harnesses} harnesses, latest {run}{html.escape(duplicate_note)}</div></div>"
+            f"{badge(f'{confirmed} unique {finding_label}', 'bad' if confirmed else 'info')}"
             "</div>"
         )
     body = f"""
@@ -567,15 +533,14 @@ def render_supervisor_table(supervisor: dict) -> str:
 
 def render_findings_panel(targets: list[dict]) -> str:
     all_findings = []
-    severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
     for target in targets:
         target_name = str(target.get("name"))
         for finding in (target.get("findings") or {}).get("findings", []):
             all_findings.append((target_name, finding))
     all_findings.sort(
         key=lambda item: (
-            severity_rank.get(str(item[1].get("severity", "")).upper(), -1),
-            str(item[1].get("run_id", "")),
+            severity_value(item[1].get("severity")),
+            str(item[1].get("last_seen", item[1].get("run_id", ""))),
         ),
         reverse=True,
     )
@@ -584,6 +549,8 @@ def render_findings_panel(targets: list[dict]) -> str:
         severity = str(finding.get("severity", "INFO"))
         report = finding.get("report")
         finding_id = str(finding.get("id", "unknown"))
+        artifacts = int(finding.get("raw_artifacts", 1) or 1)
+        occurrences = int(finding.get("occurrences", 1) or 1)
         report_link = (
             f"<a href='/file/{html.escape(str(report))}'><code>{html.escape(finding_id)}</code></a>"
             if report else f"<code>{html.escape(finding_id)}</code>"
@@ -594,6 +561,8 @@ def render_findings_panel(targets: list[dict]) -> str:
             f"<td>{badge(severity, crash_tone(severity))}</td>"
             f"<td>{html.escape(str(finding.get('type', 'unknown')))}</td>"
             f"<td>{html.escape(str(finding.get('harness', 'unknown')))}</td>"
+            f"<td>{artifacts}</td>"
+            f"<td>{occurrences}</td>"
             f"<td>{report_link}</td>"
             f"<td><a href='/run/{html.escape(target_name)}/{html.escape(str(finding.get('run_id', '')))}'>{html.escape(str(finding.get('run_id', '')))}</a></td>"
             "</tr>"
@@ -601,13 +570,15 @@ def render_findings_panel(targets: list[dict]) -> str:
     if not rows:
         return "<section class='card span12'><div class='section-head'><div><h2>Confirmed Findings</h2><p>No sanitizer-reproducible crashes have been triaged yet.</p></div>{}</div></section>".format(badge("0", "neutral"))
     count_note = "" if len(all_findings) <= len(rows) else f" Showing first {len(rows)}."
+    collapsed = sum(int(finding.get("duplicate_artifacts", 0) or 0) for _, finding in all_findings)
+    duplicate_note = f" {collapsed} duplicate artifacts are collapsed into these rows." if collapsed else ""
     return (
         "<section class='card span12'>"
         "<div class='section-head'><div><h2>Confirmed Findings</h2>"
-        f"<p>Target-wide sanitizer-reproducible crashes, including smoke and libFuzzer runs.{html.escape(count_note)}</p></div>"
+        f"<p>Target-wide unique sanitizer states across all runs.{html.escape(duplicate_note + count_note)}</p></div>"
         f"{badge(str(len(all_findings)), 'bad')}"
         "</div>"
-        + table_wrap("<table><tr><th>Target</th><th>Severity</th><th>Type</th><th>Harness</th><th>ID / Report</th><th>Run</th></tr>" + "".join(rows) + "</table>")
+        + table_wrap("<table><tr><th>Target</th><th>Severity</th><th>Type</th><th>Harness</th><th>Artifacts</th><th>Runs</th><th>ID / Report</th><th>Latest Run</th></tr>" + "".join(rows) + "</table>")
         + "</section>"
     )
 
@@ -625,12 +596,15 @@ def render_active_campaigns(workspace: Path, targets: list[dict], supervisor: di
         findings = target.get("findings") or {}
         confirmed = int(findings.get("reproducible", 0) or 0)
         high_or_critical = int(findings.get("high_or_critical", 0) or 0)
+        collapsed_duplicates = int(findings.get("duplicate_artifacts", 0) or 0)
+        raw_label = "current-run crash artifacts"
         if run_id:
             try:
                 snap = _snapshot(workspace, workspace / "runs" / name / str(run_id))
                 execs = f"{int(snap.get('execs', 0)):,}"
                 paths = f"{int(snap.get('paths', 0)):,}"
                 raw = str(snap.get("raw_crashes", 0))
+                raw_label = f"{int(snap.get('duplicate_crashes', 0) or 0)} duplicates after triage"
                 if snap.get("workers_expected"):
                     worker_text = f"{snap.get('workers_alive', 0)}/{snap.get('workers_expected', 0)} AFL++"
             except Exception:
@@ -649,8 +623,8 @@ def render_active_campaigns(workspace: Path, targets: list[dict], supervisor: di
             f"<div class='campaign-metric'><h3>Workers</h3><div class='metric'>{html.escape(worker_text)}</div><div class='metric-label'>long-running AFL++ capacity</div></div>"
             f"<div class='campaign-metric'><h3>Execs</h3><div class='metric'>{execs}</div><div class='metric-label'>total AFL++ executions</div></div>"
             f"<div class='campaign-metric'><h3>Paths</h3><div class='metric'>{paths}</div><div class='metric-label'>coverage-discovering queue paths</div></div>"
-            f"<div class='campaign-metric'><h3>Confirmed Findings</h3><div class='metric {'bad' if confirmed else ''}'>{confirmed}</div><div class='metric-label'>{high_or_critical} high or critical</div></div>"
-            f"<div class='campaign-metric'><h3>Active Raw</h3><div class='metric {'bad' if raw != '0' else ''}'>{html.escape(raw)}</div><div class='metric-label'>current-run crash artifacts</div></div>"
+            f"<div class='campaign-metric'><h3>Unique Findings</h3><div class='metric {'bad' if confirmed else ''}'>{confirmed}</div><div class='metric-label'>{high_or_critical} high/critical, {collapsed_duplicates} duplicates collapsed</div></div>"
+            f"<div class='campaign-metric'><h3>Active Raw</h3><div class='metric {'bad' if raw != '0' else ''}'>{html.escape(raw)}</div><div class='metric-label'>{html.escape(raw_label)}</div></div>"
             "</div>"
             "</section>"
         )
@@ -668,6 +642,8 @@ def render_target(workspace: Path, name: str) -> bytes:
         severity = str(finding.get("severity", "INFO"))
         report = finding.get("report")
         finding_id = str(finding.get("id", "unknown"))
+        artifacts = int(finding.get("raw_artifacts", 1) or 1)
+        occurrences = int(finding.get("occurrences", 1) or 1)
         report_link = (
             f"<a href='/file/{html.escape(str(report))}'><code>{html.escape(finding_id)}</code></a>"
             if report else f"<code>{html.escape(finding_id)}</code>"
@@ -677,6 +653,8 @@ def render_target(workspace: Path, name: str) -> bytes:
             f"<td>{badge(severity, crash_tone(severity))}</td>"
             f"<td>{html.escape(str(finding.get('type', 'unknown')))}</td>"
             f"<td>{html.escape(str(finding.get('harness', 'unknown')))}</td>"
+            f"<td>{artifacts}</td>"
+            f"<td>{occurrences}</td>"
             f"<td>{report_link}</td>"
             f"<td><a href='/run/{html.escape(name)}/{html.escape(str(finding.get('run_id', '')))}'>{html.escape(str(finding.get('run_id', '')))}</a></td>"
             "</tr>"
@@ -704,10 +682,11 @@ def render_target(workspace: Path, name: str) -> bytes:
     body = f"""
 <p class="breadcrumb"><a href="/">Dashboard</a> / {html.escape(name)}</p>
 <div class="grid">
-<section class="card metric-card span4"><div class="section-head"><h2>Harnesses</h2></div><div class="metric">{len(manifest.harnesses)}</div><div class="metric-label">configured fuzz entrypoints</div></section>
-<section class="card metric-card span4"><div class="section-head"><h2>Runs</h2></div><div class="metric">{len(runs)}</div><div class="metric-label">stored run directories</div></section>
-<section class="card metric-card span4"><div class="section-head"><h2>Findings</h2></div><div class="metric {'bad' if findings.get('reproducible') else ''}">{findings.get('reproducible', 0)}</div><div class="metric-label">{findings.get('high_or_critical', 0)} high or critical</div></section>
-<section class="card span12"><div class="section-head"><div><h2>Confirmed Findings</h2><p>Sanitizer-reproducible crashes for this target across all runs.</p></div></div>{table_wrap('<table><tr><th>Severity</th><th>Type</th><th>Harness</th><th>ID / Report</th><th>Run</th></tr>' + (''.join(finding_rows) or '<tr><td colspan="5" class="muted">No confirmed findings.</td></tr>') + '</table>')}</section>
+<section class="card metric-card span3"><div class="section-head"><h2>Harnesses</h2></div><div class="metric">{len(manifest.harnesses)}</div><div class="metric-label">configured fuzz entrypoints</div></section>
+<section class="card metric-card span3"><div class="section-head"><h2>Runs</h2></div><div class="metric">{len(runs)}</div><div class="metric-label">stored run directories</div></section>
+<section class="card metric-card span3"><div class="section-head"><h2>Unique Findings</h2></div><div class="metric {'bad' if findings.get('reproducible') else ''}">{findings.get('reproducible', 0)}</div><div class="metric-label">{findings.get('high_or_critical', 0)} high or critical</div></section>
+<section class="card metric-card span3"><div class="section-head"><h2>Duplicates</h2></div><div class="metric {'warn' if findings.get('duplicate_artifacts') else ''}">{findings.get('duplicate_artifacts', 0)}</div><div class="metric-label">raw artifacts collapsed across runs</div></section>
+<section class="card span12"><div class="section-head"><div><h2>Confirmed Findings</h2><p>Deduped by sanitizer state across all runs for this target.</p></div></div>{table_wrap('<table><tr><th>Severity</th><th>Type</th><th>Harness</th><th>Artifacts</th><th>Runs</th><th>ID / Report</th><th>Latest Run</th></tr>' + (''.join(finding_rows) or '<tr><td colspan="7" class="muted">No confirmed findings.</td></tr>') + '</table>')}</section>
 <section class="card span6"><div class="section-head"><div><h2>Manifest</h2><p>Source of truth for build and harness orchestration.</p></div></div><pre>{html.escape(json.dumps(manifest.to_dict(), indent=2))}</pre></section>
 <section class="card span6"><div class="section-head"><div><h2>Harnesses</h2><p>Each file harness can feed AFL++; libFuzzer harnesses run sanitizer smoke campaigns.</p></div></div>{table_wrap('<table><tr><th>Name</th><th>Type</th><th>Source</th><th>Argv</th></tr>' + ''.join(harness_rows) + '</table>')}</section>
 <section class="card span12"><div class="section-head"><div><h2>Runs</h2><p>Latest campaigns and smoke runs for this target.</p></div></div><div class="list">{run_items or '<div class="empty">No runs.</div>'}</div></section>
@@ -719,14 +698,27 @@ def render_target(workspace: Path, name: str) -> bytes:
 def render_run(workspace: Path, target: str, run_id: str) -> bytes:
     summary = _run_summary(workspace, target, run_id)
     triage = summary.get("triage", {})
-    crashes = triage.get("crashes", [])
+    crashes = [normalize_crash_item(item) for item in triage.get("crashes", [])]
     snap = summary.get("snapshot", {})
     coverage_inputs = summary.get("coverage_inputs", {})
     corpus_sync = summary.get("corpus_sync", {})
+    duplicate_artifacts = sum(int(c.get("duplicates", 0) or 0) for c in crashes)
+    triaged_raw = int(triage.get("raw_crashes", 0) or snap.get("triaged_raw_crashes", 0) or (len(crashes) + duplicate_artifacts))
+    reproducible_count = sum(1 for c in crashes if c.get("reproducible"))
     crash_rows = []
     for c in crashes:
         sev = str(c.get("severity", "INFO"))
-        crash_rows.append(f"<tr><td>{badge(sev, crash_tone(sev))}</td><td>{html.escape(str(c.get('type')))}</td><td><code>{html.escape(str(c.get('id')))}</code></td><td>{html.escape(str(c.get('impact')))}</td></tr>")
+        crash_rows.append(
+            "<tr>"
+            f"<td>{badge(sev, crash_tone(sev))}</td>"
+            f"<td>{html.escape(str(c.get('type')))}</td>"
+            f"<td>{html.escape(str(c.get('harness', 'unknown')))}</td>"
+            f"<td>{html.escape(str(c.get('raw_artifacts', 1)))}</td>"
+            f"<td>{html.escape(str(c.get('duplicates', 0)))}</td>"
+            f"<td><code>{html.escape(str(c.get('id')))}</code></td>"
+            f"<td>{html.escape(str(c.get('impact')))}</td>"
+            "</tr>"
+        )
     logs = "".join(f"<div class='item'><a href='/file/{html.escape(p)}'>{html.escape(p)}</a></div>" for p in summary.get("logs", []))
     reports = "".join(f"<div class='item'><a href='/file/{html.escape(p)}'>{html.escape(p)}</a></div>" for p in summary.get("reports", []))
     queue_rows = "".join(
@@ -745,17 +737,17 @@ def render_run(workspace: Path, target: str, run_id: str) -> bytes:
     body = f"""
 <p class="breadcrumb"><a href="/">Dashboard</a> / <a href="/target/{html.escape(target)}">{html.escape(target)}</a> / {html.escape(run_id)}</p>
 <div class="grid">
-<section class="card span3"><h2>Run Findings</h2><div class="metric">{len(crashes)}</div><div class="muted">sanitizer-reproducible in this run</div></section>
-<section class="card span3"><h2>Run Raw</h2><div class="metric {raw_tone}">{html.escape(str(snap.get('raw_crashes', 0)))}</div><div class="muted">untriaged artifacts in this run</div></section>
-<section class="card span3"><h2>Execs</h2><div class="metric">{html.escape(str(snap.get('execs', 0)))}</div><div class="muted">paths {html.escape(str(snap.get('paths', 0)))}</div></section>
+<section class="card span3"><h2>Run Raw</h2><div class="metric {raw_tone}">{html.escape(str(snap.get('raw_crashes', triaged_raw)))}</div><div class="muted">crash artifacts on disk</div></section>
+<section class="card span3"><h2>Unique States</h2><div class="metric">{len(crashes)}</div><div class="muted">{reproducible_count} sanitizer-reproducible</div></section>
+<section class="card span3"><h2>Duplicates</h2><div class="metric {'warn' if duplicate_artifacts else ''}">{duplicate_artifacts}</div><div class="muted">{triaged_raw} triaged artifacts represented</div></section>
 <section class="card span3"><h2>Workers</h2><div class="metric {worker_tone}">{html.escape(str(snap.get('workers_alive', 0)))}/{html.escape(str(snap.get('workers_expected', 0)))}</div><div class="muted">{'active' if snap.get('active') else 'complete'}</div></section>
 <section class="card span6"><div class="section-head"><div><h2>Actions</h2><p>Common follow-up commands for this run.</p></div></div><pre>bin/fuzzctl --runtime native monitor {html.escape(target)} --run {html.escape(run_id)} --once
 bin/fuzzctl --runtime native coverage {html.escape(target)} --run {html.escape(run_id)} --max-inputs 5000
 bin/fuzzctl --runtime native corpus sync {html.escape(target)} --run {html.escape(run_id)}
 bin/fuzzctl --runtime native report {html.escape(target)} --run {html.escape(run_id)}
 bin/fuzzctl --runtime native guide coverage {html.escape(target)} --run {html.escape(run_id)}</pre></section>
-<section class="card span6"><div class="section-head"><div><h2>Run</h2><p>Run directory and current lifecycle state.</p></div>{badge('active' if snap.get('active') else 'complete', 'ok' if snap.get('active') else 'neutral')}</div><div class="metric small">{html.escape(run_id)}</div><div class="muted">{html.escape(summary['path'])}</div></section>
-<section class="card span12"><div class="section-head"><div><h2>Unique Crashes</h2><p>Only sanitizer-reproducible findings belong here.</p></div></div>{table_wrap('<table><tr><th>Severity</th><th>Type</th><th>ID</th><th>Impact</th></tr>' + (''.join(crash_rows) or '<tr><td colspan="4" class="muted">No triaged crashes.</td></tr>') + '</table>')}</section>
+<section class="card span6"><div class="section-head"><div><h2>Run</h2><p>Run directory, lifecycle state, and execution counters.</p></div>{badge('active' if snap.get('active') else 'complete', 'ok' if snap.get('active') else 'neutral')}</div><div class="metric small">{html.escape(run_id)}</div><div class="muted">{html.escape(summary['path'])}</div><p class="muted">execs {html.escape(str(snap.get('execs', 0)))}; paths {html.escape(str(snap.get('paths', 0)))}</p></section>
+<section class="card span12"><div class="section-head"><div><h2>Unique Crashes</h2><p>One row per sanitizer state; artifact and duplicate columns explain AFL++ crash-file noise.</p></div></div>{table_wrap('<table><tr><th>Severity</th><th>Type</th><th>Harness</th><th>Artifacts</th><th>Duplicates</th><th>ID</th><th>Impact</th></tr>' + (''.join(crash_rows) or '<tr><td colspan="7" class="muted">No triaged crashes.</td></tr>') + '</table>')}</section>
 <section class="card span6"><div class="section-head"><div><h2>AFL Queue</h2><p>Coverage-discovering inputs by harness.</p></div></div>{table_wrap('<table><tr><th>Harness</th><th>Inputs</th></tr>' + (queue_rows or '<tr><td colspan="2" class="muted">No AFL queue found.</td></tr>') + '</table>')}</section>
 <section class="card span6"><div class="section-head"><div><h2>Corpus Sync</h2><p>Minimized corpus promotion state.</p></div></div>{table_wrap('<table><tr><th>Harness</th><th>Status</th><th>Files</th><th>Output</th></tr>' + (corpus_rows or '<tr><td colspan="4" class="muted">No corpus sync yet.</td></tr>') + '</table>')}</section>
 <section class="card span12"><div class="section-head"><div><h2>Coverage Inputs</h2><p>Input sources used for LLVM coverage generation.</p></div></div>{table_wrap('<table><tr><th>Harness</th><th>Selected</th><th>Sources</th></tr>' + (input_rows or '<tr><td colspan="3" class="muted">No queue-based coverage run yet.</td></tr>') + '</table>')}</section>

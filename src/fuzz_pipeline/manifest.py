@@ -25,6 +25,8 @@ class Harness:
     input_mode: str = "file"
     profiles: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    compile_flags: list[str] = field(default_factory=list)
+    link_flags: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Harness":
@@ -36,6 +38,8 @@ class Harness:
             input_mode=str(data.get("input_mode", data.get("type", "file"))),
             profiles=list(data.get("profiles", [])),
             env=dict(data.get("env", {})),
+            compile_flags=list(data.get("compile_flags", [])),
+            link_flags=list(data.get("link_flags", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,6 +51,8 @@ class Harness:
             "input_mode": self.input_mode,
             "profiles": self.profiles,
             "env": self.env,
+            "compile_flags": self.compile_flags,
+            "link_flags": self.link_flags,
         }
 
 
@@ -66,6 +72,7 @@ class TargetManifest:
     build_context: dict[str, Any] = field(default_factory=dict)
     harness_attempts: list[dict[str, Any]] = field(default_factory=list)
     coverage_goals: list[dict[str, Any]] = field(default_factory=list)
+    blocker_classifications: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TargetManifest":
@@ -87,6 +94,7 @@ class TargetManifest:
             build_context=dict(data.get("build_context", {})),
             harness_attempts=[dict(item) for item in data.get("harness_attempts", [])],
             coverage_goals=[dict(item) for item in data.get("coverage_goals", [])],
+            blocker_classifications=[dict(item) for item in data.get("blocker_classifications", [])],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +113,7 @@ class TargetManifest:
             "build_context": self.build_context,
             "harness_attempts": self.harness_attempts,
             "coverage_goals": self.coverage_goals,
+            "blocker_classifications": self.blocker_classifications,
         }
 
     def source_dir(self, workspace: Path) -> Path:

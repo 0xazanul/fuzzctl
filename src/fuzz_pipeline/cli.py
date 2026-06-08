@@ -11,7 +11,7 @@ from .builder import build_profile
 from .campaign import run_campaign, smoke, status
 from .coverage import coverage_run
 from .coverage_guidance import coverage_guidance
-from .corpus import corpus_sync
+from .corpus import corpus_enrich, corpus_prune_crashers, corpus_sync
 from .alerts import test_alert
 from .dashboard import serve_dashboard
 from .detect import detect_target
@@ -111,6 +111,7 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("smoke", help="run a short harness/sanitizer validation")
     p.add_argument("name")
     p.add_argument("--seconds", type=int, default=300)
+    p.add_argument("--leak-check", action="store_true", help="force ASan leak detection for libFuzzer smoke runs")
 
     p = sub.add_parser("run", help="run a fuzzing campaign")
     p.add_argument("name")
@@ -155,6 +156,16 @@ def _parser() -> argparse.ArgumentParser:
     p_corpus.add_argument("name")
     p_corpus.add_argument("--run")
     p_corpus.add_argument("--max-inputs", type=int, default=20000)
+    p_corpus = corpus_sub.add_parser("enrich", help="write per-harness deterministic seeds and optional Radamsa mutations")
+    p_corpus.add_argument("name")
+    p_corpus.add_argument("--mutations-per-input", type=int, default=0)
+    p_corpus.add_argument("--overwrite", action="store_true")
+    p_corpus.add_argument("--prune-crashers", action="store_true", help="quarantine seeds that crash ASan/UBSan file harnesses")
+    p_corpus.add_argument("--prune-timeout", type=float, default=2.0, help="seconds allowed per seed when pruning crashers")
+    p_corpus = corpus_sub.add_parser("prune-crashers", help="quarantine curated seeds that crash ASan/UBSan file harnesses")
+    p_corpus.add_argument("name")
+    p_corpus.add_argument("--harness", action="append", dest="harnesses", help="file harness name to check; may be repeated")
+    p_corpus.add_argument("--timeout", type=float, default=2.0, help="seconds allowed per seed")
 
     p = sub.add_parser("supervisor", help="reboot-safe campaign supervision")
     supervisor_sub = p.add_subparsers(dest="supervisor_command", required=True)
@@ -170,6 +181,9 @@ def _parser() -> argparse.ArgumentParser:
     p_sup.add_argument("--max-cycles", type=int)
     p_sup.add_argument("--no-post-cycle", action="store_true")
     p_sup.add_argument("--coverage-inputs", type=int, default=5000)
+    p_sup.add_argument("--replace-mismatched", action="store_true", help="gracefully replace active AFL++ runs whose worker plan no longer matches the manifest")
+    p_sup.add_argument("--replace-timeout", type=int, default=90, help="seconds to wait after SIGTERM before forcing stale fuzzing processes down")
+    p_sup.add_argument("--leak-smoke-seconds", type=int, default=0, help="run leak-enabled libFuzzer smoke before each supervised campaign cycle")
 
     p = sub.add_parser("guide", help="generate campaign guidance")
     guide_sub = p.add_subparsers(dest="guide_command", required=True)
@@ -330,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "smoke":
             manifest = load_manifest(workspace, args.name)
-            smoke(workspace, manifest, args.seconds)
+            smoke(workspace, manifest, args.seconds, leak_check=args.leak_check)
             return 0
         if args.command == "run":
             manifest = load_manifest(workspace, args.name)
@@ -383,6 +397,21 @@ def main(argv: list[str] | None = None) -> int:
                 manifest = load_manifest(workspace, args.name)
                 corpus_sync(workspace, manifest, args.run, max_inputs=args.max_inputs)
                 return 0
+            if args.corpus_command == "enrich":
+                manifest = load_manifest(workspace, args.name)
+                corpus_enrich(
+                    workspace,
+                    manifest,
+                    mutations_per_input=args.mutations_per_input,
+                    overwrite=args.overwrite,
+                )
+                if args.prune_crashers:
+                    corpus_prune_crashers(workspace, manifest, timeout_seconds=args.prune_timeout)
+                return 0
+            if args.corpus_command == "prune-crashers":
+                manifest = load_manifest(workspace, args.name)
+                corpus_prune_crashers(workspace, manifest, harness_names=args.harnesses, timeout_seconds=args.timeout)
+                return 0
             return 0
         if args.command == "supervisor":
             if args.supervisor_command == "status":
@@ -401,6 +430,9 @@ def main(argv: list[str] | None = None) -> int:
                     max_cycles=args.max_cycles,
                     post_cycle=not args.no_post_cycle,
                     coverage_inputs=args.coverage_inputs,
+                    replace_mismatched=args.replace_mismatched,
+                    replace_timeout=args.replace_timeout,
+                    leak_smoke_seconds=args.leak_smoke_seconds,
                 )
         if args.command == "guide":
             if args.guide_command == "coverage":

@@ -89,6 +89,59 @@ def _repro_cmd(harness: Harness, binary: Path, testcase: Path) -> list[str]:
     return _file_target_argv(binary, harness, str(testcase))
 
 
+def _profile_has_binaries(workspace: Path, manifest: TargetManifest, profile: str, harness_type: str) -> bool:
+    harnesses = [h for h in manifest.harnesses if h.type == harness_type]
+    return bool(harnesses) and all(harness_binary(workspace, manifest, profile, h).exists() for h in harnesses)
+
+
+def _matching_libfuzzer_harness(
+    workspace: Path,
+    manifest: TargetManifest,
+    file_harness: Harness,
+) -> tuple[Harness, Path, str] | None:
+    for harness in manifest.harnesses:
+        if harness.type != "libfuzzer":
+            continue
+        if harness.source != file_harness.source:
+            continue
+        binary = harness_binary(workspace, manifest, "libfuzzer_asan_ubsan", harness)
+        if binary.exists():
+            return harness, binary, "libfuzzer_asan_ubsan"
+    return None
+
+
+def _better_sanitizer_repro(
+    workspace: Path,
+    manifest: TargetManifest,
+    harness: Harness,
+    crash: Path,
+    result: Any,
+) -> tuple[Harness, Path, str, list[str], Any]:
+    if harness.type == "libfuzzer":
+        binary = harness_binary(workspace, manifest, "libfuzzer_asan_ubsan", harness)
+        return harness, binary, "libfuzzer_asan_ubsan", _repro_cmd(harness, binary, crash), result
+
+    ctype = _crash_type(result.output, result.returncode)
+    if ctype != "unknown-crash" and result.output.strip():
+        binary = harness_binary(workspace, manifest, "afl_asan_ubsan", harness)
+        return harness, binary, "afl_asan_ubsan", _repro_cmd(harness, binary, crash), result
+
+    twin = _matching_libfuzzer_harness(workspace, manifest, harness)
+    if twin is None:
+        binary = harness_binary(workspace, manifest, "afl_asan_ubsan", harness)
+        return harness, binary, "afl_asan_ubsan", _repro_cmd(harness, binary, crash), result
+
+    twin_harness, twin_binary, twin_profile = twin
+    cmd = _repro_cmd(twin_harness, twin_binary, crash)
+    twin_result = run_cmd(cmd, cwd=manifest.source_dir(workspace), env=_asan_env(), timeout=max(5, manifest.timeout_ms // 1000 + 5))
+    twin_type = _crash_type(twin_result.output, twin_result.returncode)
+    if twin_result.returncode != 0 and (twin_type != "unknown-crash" or twin_result.output.strip()):
+        return twin_harness, twin_binary, twin_profile, cmd, twin_result
+
+    binary = harness_binary(workspace, manifest, "afl_asan_ubsan", harness)
+    return harness, binary, "afl_asan_ubsan", _repro_cmd(harness, binary, crash), result
+
+
 def _crash_type(output: str, returncode: int) -> str:
     m = ASAN_RE.search(output)
     if m:
@@ -178,12 +231,22 @@ def triage_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
     if not crashes:
         print(f"no crashes found in {rel_to(run_dir, workspace)}")
         out = ensure_dir(run_dir / "triage")
-        write_json(out / "unique_crashes.json", {"target": manifest.name, "run": str(run_dir), "crashes": []})
+        write_json(
+            out / "unique_crashes.json",
+            {
+                "target": manifest.name,
+                "run": str(run_dir),
+                "raw_crashes": 0,
+                "unique_crashes": 0,
+                "duplicate_crashes": 0,
+                "crashes": [],
+            },
+        )
         return out
 
-    if any("aflpp" in c.parts for c in crashes):
+    if any("aflpp" in c.parts for c in crashes) and not _profile_has_binaries(workspace, manifest, "afl_asan_ubsan", "file"):
         build_profile(workspace, manifest, "afl_asan_ubsan")
-    if any("libfuzzer" in c.parts for c in crashes):
+    if any("libfuzzer" in c.parts for c in crashes) and not _profile_has_binaries(workspace, manifest, "libfuzzer_asan_ubsan", "libfuzzer"):
         try:
             build_profile(workspace, manifest, "libfuzzer_asan_ubsan")
         except FuzzCtlError:
@@ -208,6 +271,7 @@ def triage_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
         harness, binary, profile = _choose_harness(workspace, manifest, crash)
         cmd = _repro_cmd(harness, binary, crash)
         result = run_cmd(cmd, cwd=manifest.source_dir(workspace), env=_asan_env(), timeout=max(5, manifest.timeout_ms // 1000 + 5))
+        harness, binary, profile, cmd, result = _better_sanitizer_repro(workspace, manifest, harness, crash, result)
         output = result.output
         ctype = _crash_type(output, result.returncode)
         access = _access(output)
@@ -215,7 +279,7 @@ def triage_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
         state = _stack_state(output, ctype)
         crash_id = short_hash(state)
         trace_path = traces / f"{crash_id}.txt"
-        if not trace_path.exists():
+        if not trace_path.exists() or trace_path.stat().st_size == 0:
             trace_path.write_text(output, encoding="utf-8", errors="replace")
         item = by_state.get(crash_id)
         if item is None:
@@ -235,21 +299,32 @@ def triage_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
                 "repro_cmd": cmd,
                 "trace_path": str(trace_path),
                 "duplicates": 0,
+                "raw_artifacts": 1,
+                "duplicate_artifacts": 0,
             }
             _preserve_reproducer_metadata(by_state[crash_id], previous_by_id.get(crash_id))
         else:
             item["duplicates"] = int(item["duplicates"]) + 1
+            item["raw_artifacts"] = int(item["duplicates"]) + 1
+            item["duplicate_artifacts"] = int(item["duplicates"])
             if crash.stat().st_size < int(item["original_size"]):
                 item["original_path"] = str(crash)
                 item["original_size"] = crash.stat().st_size
+                item["harness"] = harness.name
+                item["profile"] = profile
+                item["binary"] = str(binary)
+                item["repro_cmd"] = cmd
 
     result = {
         "target": manifest.name,
         "run": str(run_dir),
+        "raw_crashes": len(crashes),
+        "unique_crashes": len(by_state),
+        "duplicate_crashes": max(0, len(crashes) - len(by_state)),
         "crashes": sorted(by_state.values(), key=lambda x: ("CRITICAL HIGH MEDIUM LOW".find(x["severity"]), x["type"])),
     }
     write_json(out / "unique_crashes.json", result)
-    print(f"triaged {len(crashes)} crash files into {len(by_state)} unique states")
+    print(f"triaged {len(crashes)} crash files into {len(by_state)} unique states ({max(0, len(crashes) - len(by_state))} duplicates)")
     print(f"triage output: {rel_to(out, workspace)}")
     return out
 

@@ -1,0 +1,35 @@
+# Runtime and target data.
+build/
+corpora/
+fixtures/
+repos/
+runs/
+state/
+targets/
+workorders/
+
+# Python caches and virtual environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local secrets and logs.
+.env
+.env.*
+*.secret
+*.secrets
+secrets/
+*.log
+*.tmp
+
+# VCS/editor noise.
+.git/
+.gitignore
+.DS_Store
+.idea/
+.vscode/

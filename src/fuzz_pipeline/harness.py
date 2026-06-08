@@ -10,7 +10,7 @@ from .build_context import load_build_context
 from .builder import build_profile
 from .detect import CPP_EXTS, C_EXTS
 from .manifest import TargetManifest, save_manifest
-from .util import FuzzCtlError, ensure_dir, now_id, read_json, rel_to, run_cmd, short_hash, write_json
+from .util import FuzzCtlError, ensure_dir, find_latest_run, now_id, read_json, rel_to, run_cmd, short_hash, write_json
 
 
 ENTRY_RE = re.compile(
@@ -886,23 +886,40 @@ def review_harnesses(workspace: Path, manifest: TargetManifest, *, as_json: bool
 
 
 def _seed_count(workspace: Path, manifest: TargetManifest) -> int:
+    count = 0
     seed_dir = manifest.seed_dir(workspace)
-    if not seed_dir.exists():
-        return 0
-    return sum(1 for path in seed_dir.iterdir() if path.is_file())
+    if seed_dir.exists():
+        count += sum(1 for path in seed_dir.iterdir() if path.is_file())
+
+    for harness in manifest.harnesses:
+        curated = workspace / "corpora" / manifest.name / harness.name / "current"
+        if curated.exists():
+            count += sum(1 for path in curated.iterdir() if path.is_file())
+    return count
 
 
 def _build_artifacts(workspace: Path, manifest: TargetManifest) -> dict[str, int]:
     out: dict[str, int] = {}
     for profile in ["afl_asan_ubsan", "afl_lto_cmplog", "libfuzzer_asan_ubsan", "coverage"]:
         build_json = workspace / "build" / manifest.name / profile / "build.json"
+        expected_binaries = 0
+        for harness in manifest.harnesses:
+            if harness.profiles and profile not in harness.profiles:
+                continue
+            if profile == "libfuzzer_asan_ubsan" and harness.type != "libfuzzer":
+                continue
+            if profile != "libfuzzer_asan_ubsan" and harness.type == "libfuzzer":
+                continue
+            if harness.source and (workspace / "build" / manifest.name / profile / harness.name).exists():
+                expected_binaries += 1
         if not build_json.exists():
-            out[profile] = 0
+            out[profile] = expected_binaries
             continue
         try:
-            out[profile] = len(read_json(build_json).get("artifacts", []))
+            metadata_artifacts = len(read_json(build_json).get("artifacts", []))
         except Exception:
-            out[profile] = 0
+            metadata_artifacts = 0
+        out[profile] = max(metadata_artifacts, expected_binaries)
     return out
 
 
@@ -910,10 +927,26 @@ def _latest_fuzz_run(workspace: Path, name: str) -> Path | None:
     run_root = workspace / "runs" / name
     if not run_root.exists():
         return None
-    for run_dir in reversed(sorted([p for p in run_root.iterdir() if p.is_dir()])):
+    runs = sorted([p for p in run_root.iterdir() if p.is_dir() and p.name != "background"])
+    if not runs:
+        return None
+
+    try:
+        current = find_latest_run(workspace, name)
+        if _coverage_reports(current):
+            return current
+    except FuzzCtlError:
+        current = None
+
+    for run_dir in reversed(runs):
+        if _coverage_reports(run_dir):
+            return run_dir
+    if current is not None and ((current / "aflpp").exists() or (current / "libfuzzer").exists()):
+        return current
+    for run_dir in reversed(runs):
         if (run_dir / "run.json").exists():
             return run_dir
-        if (run_dir / "coverage").exists() or (run_dir / "aflpp").exists() or (run_dir / "libfuzzer").exists():
+        if (run_dir / "aflpp").exists() or (run_dir / "libfuzzer").exists():
             return run_dir
     return None
 
@@ -927,6 +960,7 @@ def _coverage_reports(run_dir: Path | None) -> list[Path]:
 def _parse_llvm_coverage_report(path: Path) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     total: dict[str, float] | None = None
+    harness_name = path.name.removesuffix(".report.txt")
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith(("Filename", "---")):
@@ -935,12 +969,126 @@ def _parse_llvm_coverage_report(path: Path) -> dict[str, Any]:
         if len(percents) < 3:
             continue
         file_name = stripped.split()[0]
-        item = {"file": file_name, "region": percents[0], "function": percents[1], "line": percents[2]}
+        item = {
+            "file": file_name,
+            "region": percents[0],
+            "function": percents[1],
+            "line": percents[2],
+            "report": str(path),
+            "harness": harness_name,
+        }
         if file_name == "TOTAL":
-            total = {k: float(v) for k, v in item.items() if k != "file"}
+            total = {"region": percents[0], "function": percents[1], "line": percents[2]}
         else:
             rows.append(item)
     return {"report": str(path), "total": total, "files": rows}
+
+
+def _coverage_row_score(row: dict[str, Any]) -> tuple[float, float, float]:
+    return (float(row["line"]), float(row["function"]), float(row["region"]))
+
+
+def _coverage_row_is_better(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool:
+    if current is None:
+        return True
+    return _coverage_row_score(candidate) > _coverage_row_score(current)
+
+
+def _is_header_coverage_row(row: dict[str, Any]) -> bool:
+    return Path(str(row["file"])).suffix.lower() in {".h", ".hh", ".hpp", ".hxx"}
+
+
+def _is_harness_coverage_row(row: dict[str, Any]) -> bool:
+    file_name = str(row["file"]).replace("\\", "/")
+    return file_name.startswith("fuzz_harnesses/") or "/fuzz_harnesses/" in file_name
+
+
+def _is_harness_source_path(value: str) -> bool:
+    file_name = str(value).replace("\\", "/")
+    return file_name.startswith("fuzz_harnesses/") or "/fuzz_harnesses/" in file_name
+
+
+def _best_file_rows(reports: list[dict[str, Any]], source_dir: Path) -> dict[str, dict[str, Any]]:
+    file_rows: dict[str, dict[str, Any]] = {}
+    for report in reports:
+        for row in report["files"]:
+            aliases = {str(row["file"]), Path(str(row["file"])).name}
+            path = Path(str(row["file"]))
+            if path.is_absolute():
+                aliases.add(rel_to(path, source_dir))
+            for alias in aliases:
+                if _coverage_row_is_better(row, file_rows.get(alias)):
+                    file_rows[alias] = row
+    return file_rows
+
+
+def _classification_values(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, list):
+        return {str(item) for item in value}
+    return {str(value)}
+
+
+def _normalized_path(value: Any) -> str:
+    return str(value or "").replace("\\", "/").strip("/")
+
+
+def _blocker_classification_matches(rule: dict[str, Any], blocker: dict[str, Any]) -> bool:
+    has_selector = False
+
+    candidates = _classification_values(rule.get("candidate"))
+    if candidates:
+        has_selector = True
+        if str(blocker.get("candidate", "")) not in candidates:
+            return False
+
+    kinds = _classification_values(rule.get("kind"))
+    if kinds:
+        has_selector = True
+        if str(blocker.get("kind", "")) not in kinds:
+            return False
+
+    functions = _classification_values(rule.get("function"))
+    if functions:
+        has_selector = True
+        if str(blocker.get("function", "")) not in functions:
+            return False
+
+    files = {_normalized_path(item) for item in _classification_values(rule.get("file"))}
+    if files:
+        has_selector = True
+        blocker_file = _normalized_path(blocker.get("file"))
+        blocker_name = Path(blocker_file).name
+        if blocker_file not in files and blocker_name not in files:
+            return False
+
+    return has_selector
+
+
+def _blocker_classification(rule: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: rule.get(key)
+        for key in ["status", "reason", "action", "owner", "expires"]
+        if rule.get(key) is not None
+    }
+
+
+def _apply_blocker_classifications(
+    blockers: list[dict[str, Any]],
+    classifications: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    unresolved: list[dict[str, Any]] = []
+    classified: list[dict[str, Any]] = []
+    for blocker in blockers:
+        rule = next((item for item in classifications if _blocker_classification_matches(item, blocker)), None)
+        if rule is None:
+            unresolved.append(blocker)
+            continue
+        annotated = dict(blocker)
+        annotated["classification"] = _blocker_classification(rule)
+        classified.append(annotated)
+    return unresolved, classified
 
 
 def _coverage_total(run_dir: Path | None) -> dict[str, float] | None:
@@ -963,6 +1111,33 @@ def _coverage_total(run_dir: Path | None) -> dict[str, float] | None:
         "reports": len(totals),
     }
     return weakest
+
+
+def _coverage_target_total(run_dir: Path | None) -> dict[str, Any] | None:
+    if run_dir is None:
+        return None
+    reports = _coverage_reports(run_dir)
+    if not reports:
+        return None
+    best_target_rows: list[dict[str, Any]] = []
+    for parsed in (_parse_llvm_coverage_report(path) for path in reports):
+        target_rows = [
+            row
+            for row in parsed["files"]
+            if not _is_header_coverage_row(row) and not _is_harness_coverage_row(row)
+        ]
+        if not target_rows:
+            continue
+        best_target_rows.append(max(target_rows, key=_coverage_row_score))
+    if not best_target_rows:
+        return None
+    return {
+        "region": min(item["region"] for item in best_target_rows),
+        "function": min(item["function"] for item in best_target_rows),
+        "line": min(item["line"] for item in best_target_rows),
+        "reports": len(best_target_rows),
+        "mode": "best_target_file_per_report",
+    }
 
 
 def _draft_harness(candidate: dict[str, Any], manifest: TargetManifest) -> str:
@@ -1111,15 +1286,7 @@ def harness_blockers(
     build_context = load_build_context(workspace, manifest)
     candidates = _enrich_candidates_with_context(data["candidate_entrypoints"], build_context)
 
-    file_rows: dict[str, dict[str, Any]] = {}
-    for report in reports:
-        for row in report["files"]:
-            file_value = str(row["file"])
-            file_rows[file_value] = row
-            file_rows[Path(file_value).name] = row
-            path = Path(file_value)
-            if path.is_absolute():
-                file_rows[rel_to(path, source_dir)] = row
+    file_rows = _best_file_rows(reports, source_dir)
 
     blockers: list[dict[str, Any]] = []
     if not file_rows:
@@ -1135,10 +1302,14 @@ def harness_blockers(
         if row["file"] in seen_rows:
             continue
         seen_rows.add(row["file"])
+        if _is_header_coverage_row(row) or _is_harness_coverage_row(row):
+            continue
         if row["line"] < 40 or row["function"] < 50:
             blockers.append({"kind": "low_coverage_file", **row})
     if file_rows:
         for candidate in candidates[:50]:
+            if _is_harness_source_path(candidate["relative_file"]):
+                continue
             row = file_rows.get(candidate["relative_file"]) or file_rows.get(Path(candidate["relative_file"]).name)
             if row is None:
                 blockers.append(
@@ -1161,11 +1332,25 @@ def harness_blockers(
                     }
                 )
 
+    unresolved_blockers, classified_blockers = _apply_blocker_classifications(
+        blockers,
+        manifest.blocker_classifications,
+    )
+
     result = {
         "target": manifest.name,
         "run": str(run_dir),
         "reports": reports,
-        "blockers": blockers[:100],
+        "summary": {
+            "reports": len(reports),
+            "covered_files": len({row["file"] for row in file_rows.values()}),
+            "blockers": len(unresolved_blockers),
+            "classified_blockers": len(classified_blockers),
+            "raw_blockers": len(blockers),
+            "best_file_rows": True,
+        },
+        "blockers": unresolved_blockers[:100],
+        "classified": classified_blockers[:100],
         "recommendations": [
             "Prefer candidates whose compile database unit exists and whose file has low or absent coverage.",
             "Add valid seeds/dictionaries before increasing campaign duration.",
@@ -1175,12 +1360,23 @@ def harness_blockers(
     out = ensure_dir(run_dir / "guidance")
     write_json(out / "harness-blockers.json", result)
     md = [f"# Harness Blockers: {manifest.name}", "", f"Run: `{rel_to(run_dir, workspace)}`", ""]
+    md.append("## Unresolved")
+    md.append("")
     for blocker in result["blockers"][:40]:
         subject = blocker.get("file") or "-"
         detail = blocker.get("function") or blocker.get("reason", "")
         md.append(f"- `{blocker['kind']}`: `{subject}` {detail}")
     if not result["blockers"]:
-        md.append("- No blocker rows found. Run coverage first or inspect the HTML coverage report.")
+        md.append("- No unresolved blocker rows found.")
+    if result["classified"]:
+        md.extend(["", "## Classified", ""])
+        for blocker in result["classified"][:40]:
+            subject = blocker.get("file") or "-"
+            detail = blocker.get("function") or blocker.get("reason", "")
+            classification = blocker.get("classification", {})
+            status = classification.get("status", "classified")
+            reason = classification.get("reason", "documented in target manifest")
+            md.append(f"- `{status}` `{blocker['kind']}`: `{subject}` {detail} - {reason}")
     (out / "harness-blockers.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     if as_json:
         print(json.dumps(result, indent=2, sort_keys=True))
@@ -1190,6 +1386,8 @@ def harness_blockers(
             subject = blocker.get("file") or "-"
             detail = blocker.get("function") or blocker.get("reason", "")
             print(f"- {blocker['kind']}: {subject} {detail}")
+        if result["classified"]:
+            print(f"classified blockers: {len(result['classified'])}")
     return result
 
 
@@ -1231,7 +1429,7 @@ def score_harnesses(
     builds = _build_artifacts(workspace, manifest)
     seed_count = _seed_count(workspace, manifest)
     run_dir = workspace / "runs" / manifest.name / run_id if run_id else _latest_fuzz_run(workspace, manifest.name)
-    coverage = _coverage_total(run_dir)
+    coverage = _coverage_target_total(run_dir)
     score = 0
     factors: list[dict[str, Any]] = []
 

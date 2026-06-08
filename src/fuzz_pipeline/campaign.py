@@ -26,11 +26,29 @@ def _seed_dir(workspace: Path, manifest: TargetManifest, run_dir: Path) -> Path:
     return fallback
 
 
-def _copy_seed_corpus(seed_dir: Path, destination: Path) -> Path:
+def _copy_seed_corpus(seed_dir: Path, destination: Path, *, prefix: str = "") -> Path:
     ensure_dir(destination)
+    index = 0
     for seed in sorted(seed_dir.iterdir()):
         if seed.is_file():
-            shutil.copy2(seed, destination / seed.name)
+            name = f"{prefix}{seed.name}" if prefix else seed.name
+            target = destination / name
+            while target.exists():
+                index += 1
+                target = destination / f"{prefix}{index:04d}-{seed.name}"
+            shutil.copy2(seed, target)
+    return destination
+
+
+def _prepare_harness_seed_corpus(workspace: Path, manifest: TargetManifest, run_dir: Path, harness: Harness) -> Path:
+    destination = ensure_dir(run_dir / "seeds" / harness.name)
+    base_seed = _seed_dir(workspace, manifest, run_dir)
+    _copy_seed_corpus(base_seed, destination, prefix="base-")
+    curated = workspace / "corpora" / manifest.name / harness.name / "current"
+    if curated.exists() and any(p.is_file() for p in curated.iterdir()):
+        _copy_seed_corpus(curated, destination, prefix="curated-")
+    if not any(destination.iterdir()):
+        (destination / "seed").write_bytes(b"\x00")
     return destination
 
 
@@ -54,7 +72,10 @@ def _worker_counts(harnesses: list[Harness], workers: int) -> dict[str, int]:
     if not harnesses:
         return {}
     counts = {h.name: 0 for h in harnesses}
-    for index in range(workers):
+    if workers <= 0:
+        return counts
+    effective_workers = max(workers, len(harnesses))
+    for index in range(effective_workers):
         counts[harnesses[index % len(harnesses)].name] += 1
     return counts
 
@@ -63,6 +84,7 @@ def _asan_env() -> dict[str, str]:
     return {
         "AFL_SKIP_CPUFREQ": "1",
         "AFL_NO_UI": "1",
+        "AFL_NO_AFFINITY": "1",
         "AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES": "1",
         "ASAN_OPTIONS": (
             "abort_on_error=1:detect_leaks=1:detect_stack_use_after_return=1:"
@@ -70,6 +92,17 @@ def _asan_env() -> dict[str, str]:
         ),
         "UBSAN_OPTIONS": "halt_on_error=1:abort_on_error=1:print_stacktrace=1",
     }
+
+
+def _merge_harness_env(base: dict[str, str], harness: Harness, *, detect_leaks: bool | None = None) -> dict[str, str]:
+    env = base.copy()
+    env.update(harness.env)
+    if detect_leaks is not None:
+        options = env.get("ASAN_OPTIONS", "")
+        parts = [part for part in options.split(":") if part and not part.startswith("detect_leaks=")]
+        parts.append(f"detect_leaks={1 if detect_leaks else 0}")
+        env["ASAN_OPTIONS"] = ":".join(parts)
+    return env
 
 
 def _file_target_argv(binary: Path, harness: Harness, testcase: str = "@@") -> list[str]:
@@ -81,7 +114,14 @@ def _file_target_argv(binary: Path, harness: Harness, testcase: str = "@@") -> l
     return argv
 
 
-def run_libfuzzer(workspace: Path, manifest: TargetManifest, seconds: int, label: str = "libfuzzer") -> Path:
+def run_libfuzzer(
+    workspace: Path,
+    manifest: TargetManifest,
+    seconds: int,
+    label: str = "libfuzzer",
+    *,
+    detect_leaks: bool | None = None,
+) -> Path:
     harnesses = _harnesses(manifest, "libfuzzer")
     if not harnesses:
         raise FuzzCtlError(f"target {manifest.name} has no libFuzzer harness")
@@ -92,13 +132,13 @@ def run_libfuzzer(workspace: Path, manifest: TargetManifest, seconds: int, label
         run_dir / "run.json",
         {"target": manifest.name, "engine": "libfuzzer", "seconds": seconds, "status": "running", "started_at": int(time.time())},
     )
-    seed = _seed_dir(workspace, manifest, run_dir)
     for harness in harnesses:
         binary = harness_binary(workspace, manifest, "libfuzzer_asan_ubsan", harness)
         if not binary.exists():
             raise FuzzCtlError(f"libFuzzer binary missing: {binary}")
         crashes = ensure_dir(run_dir / "libfuzzer" / harness.name / "crashes")
-        corpus = _copy_seed_corpus(seed, ensure_dir(run_dir / "libfuzzer" / harness.name / "corpus"))
+        harness_seed = _prepare_harness_seed_corpus(workspace, manifest, run_dir, harness)
+        corpus = _copy_seed_corpus(harness_seed, ensure_dir(run_dir / "libfuzzer" / harness.name / "corpus"))
         cmd = [
             str(binary),
             str(corpus),
@@ -110,8 +150,7 @@ def run_libfuzzer(workspace: Path, manifest: TargetManifest, seconds: int, label
         dictionary = manifest.dictionary_path(workspace)
         if dictionary:
             cmd.append(f"-dict={dictionary}")
-        env = _asan_env()
-        env.update(harness.env)
+        env = _merge_harness_env(_asan_env(), harness, detect_leaks=detect_leaks)
         result = run_cmd(cmd, env=env, timeout=seconds + 30, print_cmd=True)
         log = run_dir / "libfuzzer" / harness.name / "run.log"
         log.write_text(result.output, encoding="utf-8", errors="replace")
@@ -136,6 +175,7 @@ def run_libfuzzer(workspace: Path, manifest: TargetManifest, seconds: int, label
             "target": manifest.name,
             "engine": "libfuzzer",
             "seconds": seconds,
+            "detect_leaks": detect_leaks,
             "status": status,
             "raw_crashes": total_crashes,
             "harness_results": harness_results,
@@ -169,7 +209,9 @@ def run_aflpp(
         print(f"warning: CMPLOG profile unavailable: {exc}")
     workers = workers or cpu_default_workers()
     run_dir = _run_dir(workspace, manifest.name, label)
+    requested_workers = workers
     worker_counts = _worker_counts(file_harnesses, workers)
+    workers = sum(worker_counts.values())
     write_json(
         run_dir / "run.json",
         {
@@ -177,12 +219,12 @@ def run_aflpp(
             "engine": "aflpp",
             "seconds": seconds,
             "workers": workers,
+            "requested_workers": requested_workers,
             "worker_counts": worker_counts,
             "status": "running",
             "started_at": int(time.time()),
         },
     )
-    seed = _seed_dir(workspace, manifest, run_dir)
     procs: list[tuple[subprocess.Popen[bytes], object]] = []
     base_env = os.environ.copy()
     base_env.update(_asan_env())
@@ -195,17 +237,17 @@ def run_aflpp(
         if not binary.exists():
             raise FuzzCtlError(f"AFL++ binary missing: {binary}")
         cmplog_binary = harness_binary(workspace, manifest, "afl_lto_cmplog", harness)
+        harness_seed = _prepare_harness_seed_corpus(workspace, manifest, run_dir, harness)
         findings = ensure_dir(run_dir / "aflpp" / harness.name / "findings")
         logs = ensure_dir(run_dir / "aflpp" / harness.name / "logs")
-        env = base_env.copy()
-        env.update(harness.env)
+        env = _merge_harness_env(base_env, harness)
         for index in range(harness_workers):
             role = "main" if index == 0 else f"sec{index}"
             mode = ["-M", role] if index == 0 else ["-S", role, "-p", schedules[index % len(schedules)]]
             cmd = [
                 "afl-fuzz",
                 "-i",
-                str(seed),
+                str(harness_seed),
                 "-o",
                 str(findings),
                 *mode,
@@ -254,6 +296,7 @@ def run_aflpp(
             "engine": "aflpp",
             "seconds": seconds,
             "workers": workers,
+            "requested_workers": requested_workers,
             "worker_counts": worker_counts,
             "status": status,
             "raw_crashes": total_crashes,
@@ -264,9 +307,10 @@ def run_aflpp(
     return run_dir
 
 
-def smoke(workspace: Path, manifest: TargetManifest, seconds: int) -> Path:
+def smoke(workspace: Path, manifest: TargetManifest, seconds: int, *, leak_check: bool = False) -> Path:
     if _harnesses(manifest, "libfuzzer"):
-        return run_libfuzzer(workspace, manifest, seconds, label="smoke-libfuzzer")
+        label = "smoke-libfuzzer-leaks" if leak_check else "smoke-libfuzzer"
+        return run_libfuzzer(workspace, manifest, seconds, label=label, detect_leaks=True if leak_check else None)
     return run_aflpp(workspace, manifest, seconds, workers=1, label="smoke-aflpp")
 
 
