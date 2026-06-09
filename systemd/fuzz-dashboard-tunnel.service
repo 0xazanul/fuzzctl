@@ -1,0 +1,14 @@
+[Unit]
+Description=Fuzz Pipeline public HTTPS dashboard tunnel
+After=network-online.target fuzz-dashboard-lan.service
+Wants=network-online.target fuzz-dashboard-lan.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:39445 --url http://127.0.0.1:8089
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -3,10 +3,19 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import platform
 from pathlib import Path
 
 from .docker_runtime import docker_access, image_exists
-from .util import FuzzCtlError, run_cmd, which_any
+from .util import FuzzCtlError, ensure_dir, run_cmd, which_any
+from .advanced_tools import (
+    advanced_tool_status,
+    clone_advanced_tool,
+    external_tools_dir,
+    print_advanced_tool_status,
+    write_advanced_install_plan,
+)
+from .symcc_tools import symcc_self_test
 
 
 CORE_TOOLS = [
@@ -163,3 +172,55 @@ def install_core(workspace: Path, *, dry_run: bool = False) -> int:
             print(f"Docker access still not usable: {docker_error}")
 
     return tools_doctor(workspace, deep=True)
+
+
+def tools_advanced(workspace: Path, *, as_json: bool = False) -> int:
+    status = advanced_tool_status(workspace)
+    print_advanced_tool_status(status, as_json=as_json)
+    return 0
+
+
+def tools_symcc_self_test(workspace: Path, *, as_json: bool = False) -> int:
+    result = symcc_self_test(workspace, as_json=as_json)
+    return 0 if result.get("status") == "ok" else 2
+
+
+def install_advanced(workspace: Path, *, tool: str | None = None, dry_run: bool = False) -> int:
+    if tool in {None, "plan"}:
+        write_advanced_install_plan(workspace)
+        return 0
+    if tool in {"oss-fuzz-gen", "grammar-mutator", "symcc", "exploitable"}:
+        clone_advanced_tool(workspace, tool, dry_run=dry_run)
+        return 0
+    if tool == "casr":
+        arch = platform.machine()
+        if arch not in {"x86_64", "aarch64"}:
+            raise FuzzCtlError(f"CASR release installer does not know architecture: {arch}")
+        target = f"{arch}-unknown-linux-gnu"
+        version = "v2.13.1"
+        name = f"casr-{target}.tar.xz"
+        base = f"https://github.com/ispras/casr/releases/download/{version}"
+        dest = ensure_dir(external_tools_dir(workspace) / "casr")
+        archive = dest / name
+        checksum = dest / f"{name}.sha256"
+        commands = [
+            ["curl", "-L", "-o", str(archive), f"{base}/{name}"],
+            ["curl", "-L", "-o", str(checksum), f"{base}/{name}.sha256"],
+            ["sha256sum", "-c", str(checksum.name)],
+            ["tar", "-xJf", str(archive.name)],
+        ]
+        for cmd in commands:
+            print("$ " + " ".join(cmd))
+            if not dry_run:
+                run_cmd(cmd, cwd=dest, check=True, print_cmd=False)
+        bin_dir = ensure_dir(Path.home() / ".local" / "bin")
+        extracted = dest / f"casr-{target}"
+        if not dry_run:
+            for binary in extracted.glob("casr-*"):
+                link = bin_dir / binary.name
+                if link.exists() or link.is_symlink():
+                    link.unlink()
+                link.symlink_to(binary.resolve())
+        print(f"CASR release installed under {dest}; symlinks in {bin_dir}")
+        return 0
+    raise FuzzCtlError("advanced tool must be one of: plan, oss-fuzz-gen, grammar-mutator, symcc, casr, exploitable")

@@ -1,43 +1,45 @@
 from __future__ import annotations
 
 import html
-import getpass
 import hmac
 import json
 import os
-import socket
-import subprocess
-import threading
-import time
-import urllib.request
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .detect import detect_target
-from .findings import normalize_crash_item, severity_value, target_findings
+from .dashboard_state import (
+    _safe,
+    _target_crash_value,
+    _target_findings,
+    _targets,
+    collect_dashboard_state,
+    connectivity_info,
+)
+from .dashboard_crash import render_crash_value_detail_body
+from .dashboard_home import render_home_body
+from .dashboard_target import render_target_body
+from .dashboard_run import render_run_body
 from .launch import launch_repo
 from .manifest import load_manifest
-from .monitor import _snapshot, monitor_once
-from .supervisor import active_fuzz_processes
-from .tools import collect_tool_status
-from .util import FuzzCtlError, default_workspace, find_latest_run, human_bytes, read_json, rel_to
+from .util import FuzzCtlError, default_workspace, read_json
 
 
 CSS = """
-:root{color-scheme:light;--bg:#f6f8fc;--surface:#fff;--surface2:#f7f9fc;--surface3:#eef4ff;--text:#1f1f1f;--muted:#667085;--line:#e4e7ec;--line2:#d0d5dd;--primary:#1a73e8;--primary2:#1557b0;--primaryText:#fff;--ok:#16833a;--okBg:#eaf6ee;--warn:#a75d00;--warnBg:#fff6dc;--bad:#c5221f;--badBg:#fdebea;--info:#185abc;--infoBg:#edf4ff;--shadow:0 1px 2px rgba(16,24,40,.05);--shadow2:0 16px 40px rgba(16,24,40,.10)}
-:root[data-theme="dark"]{color-scheme:dark;--bg:#101318;--surface:#171b22;--surface2:#1d232d;--surface3:#172b46;--text:#f1f3f4;--muted:#a9b1bd;--line:#2b333f;--line2:#3b4554;--primary:#8ab4f8;--primary2:#aecbfa;--primaryText:#111418;--ok:#81c995;--okBg:#142f20;--warn:#fdd663;--warnBg:#352911;--bad:#f28b82;--badBg:#351d1c;--info:#8ab4f8;--infoBg:#172b46;--shadow:0 1px 2px rgba(0,0,0,.22);--shadow2:0 16px 44px rgba(0,0,0,.32)}
-*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Google Sans","Inter",system-ui,-apple-system,Segoe UI,sans-serif;letter-spacing:0}a{color:var(--primary2);text-decoration:none}a:hover{text-decoration:underline}
-.topbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:18px;min-height:60px;padding:0 28px;background:color-mix(in srgb,var(--surface) 88%,transparent);border-bottom:1px solid var(--line);backdrop-filter:saturate(180%) blur(16px)}.brand{display:flex;align-items:center;gap:11px;min-width:236px;color:var(--text)}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:32px;height:32px;border-radius:8px;background:var(--text);color:var(--surface);font-weight:850;font-size:12px}.brand-name{display:block;font-size:15px;font-weight:760}.brand-sub{display:block;font-size:11px;color:var(--muted);margin-top:1px}.topnav{display:flex;gap:4px;flex:1}.topnav a{color:var(--muted);padding:7px 10px;border-radius:6px;font-weight:650;font-size:13px}.topnav a:hover{background:var(--surface2);color:var(--text);text-decoration:none}.theme-toggle{width:auto;flex:0 0 auto;display:inline-flex;align-items:center;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:999px;padding:7px 11px;font-weight:750;font-size:12px}
-.page{max-width:1440px;margin:0 auto;padding:26px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:0 0 18px}.eyebrow{font-size:11px;color:var(--primary2);font-weight:850;text-transform:uppercase;letter-spacing:.08em}.page-heading h1{margin:3px 0 0;font-size:26px;line-height:1.15;font-weight:760}.sub{color:var(--muted);margin-top:4px}h1,h2,h3{letter-spacing:0}h2{margin:0;font-size:15px;line-height:1.25;font-weight:760}h3{margin:0 0 8px;font-size:12px;color:var(--muted);font-weight:800;text-transform:uppercase;letter-spacing:.04em}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.section-head p{margin:4px 0 0;color:var(--muted)}
-.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px}.card{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:var(--shadow)}.span3{grid-column:span 3}.span4{grid-column:span 4}.span5{grid-column:span 5}.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span12{grid-column:span 12}
-.metric{font-size:28px;line-height:1.05;font-weight:780;margin-top:8px}.metric.small{font-size:15px;overflow-wrap:anywhere}.metric-label{color:var(--muted);font-size:12px;margin-top:5px}.metric-card{min-height:116px}.muted{color:var(--muted)}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.info{color:var(--info)}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid transparent;border-radius:999px;padding:3px 9px;font-size:11px;font-weight:850;white-space:nowrap}.status:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.status.ok{background:var(--okBg);color:var(--ok)}.status.warn{background:var(--warnBg);color:var(--warn)}.status.bad{background:var(--badBg);color:var(--bad)}.status.info{background:var(--infoBg);color:var(--info)}.status.neutral{background:var(--surface2);color:var(--muted);border-color:var(--line)}
-.campaign-card{background:linear-gradient(180deg,color-mix(in srgb,var(--surface) 98%,var(--surface3)),var(--surface));border:1px solid var(--line);border-radius:8px;padding:20px;box-shadow:var(--shadow2)}.campaign-title{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:18px}.campaign-title h2{font-size:20px}.campaign-title p{margin:5px 0 0;color:var(--muted)}.campaign-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--surface)}.campaign-metric{padding:16px;border-right:1px solid var(--line)}.campaign-metric:last-child{border-right:0}.campaign-metric .metric{font-size:26px}.campaign-metric h3{margin-bottom:10px}
-.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:4px 9px;margin:2px;background:var(--surface2);color:var(--muted);font-weight:750;font-size:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}table{width:100%;border-collapse:collapse;min-width:520px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);background:var(--surface2);font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:850}tr:last-child td{border-bottom:0}td{overflow-wrap:anywhere}code,pre{font-family:"Roboto Mono","SFMono-Regular",Consolas,monospace;background:var(--surface2);border:1px solid var(--line);border-radius:6px}code{padding:2px 6px;font-size:12px}pre{padding:14px;overflow:auto;max-height:520px;white-space:pre-wrap;overflow-wrap:anywhere}
-label{display:block;margin:12px 0 6px;color:var(--muted);font-weight:800;font-size:11px;text-transform:uppercase;letter-spacing:.04em}input,select{width:100%;background:var(--surface);border:1px solid var(--line2);border-radius:6px;color:var(--text);padding:10px 11px;outline:none}input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 16%,transparent)}button,.button{display:inline-flex;align-items:center;justify-content:center;background:var(--primary);border:0;color:var(--primaryText);border-radius:6px;padding:10px 14px;font-weight:800;cursor:pointer;min-height:38px;text-decoration:none}button:hover,.button:hover{text-decoration:none;filter:brightness(.98)}button.secondary,.button.secondary{background:var(--surface);border:1px solid var(--line2);color:var(--text)}
-.row{display:flex;gap:12px;align-items:end}.row>*{flex:1}.small{font-size:12px}.list{display:grid;gap:9px}.item{display:block;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.item:hover{border-color:var(--line2);box-shadow:var(--shadow)}.target-item{display:flex;align-items:center;justify-content:space-between;gap:12px}.target-name{font-weight:800}.target-meta{color:var(--muted);font-size:12px;margin-top:2px}.breadcrumb{margin:0 0 18px;color:var(--muted)}.breadcrumb a{font-weight:700}.empty{padding:18px;color:var(--muted);background:var(--surface2);border:1px dashed var(--line2);border-radius:8px}
-details.card{padding:0;overflow:hidden}details.card summary{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 16px;cursor:pointer}details.card summary::-webkit-details-marker{display:none}details.card summary:after{content:"Open";font-size:11px;color:var(--muted);font-weight:850;text-transform:uppercase;letter-spacing:.05em}details[open].card summary:after{content:"Close"}details.card .details-body{padding:0 16px 16px}
-.nowrap{white-space:nowrap}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+:root{color-scheme:light;--bg:#f3f0e8;--bg2:#e8edf0;--surface:#fffdf8;--surface2:#f6f3ec;--surface3:#eef6f2;--text:#1d211f;--muted:#66736c;--line:#ded8cc;--line2:#c7bdae;--primary:#0c6b58;--primary2:#084f42;--primaryText:#fffdf8;--accent:#c56a2c;--accent2:#175c9a;--ok:#147a4c;--okBg:#e6f4ec;--warn:#a35b00;--warnBg:#fff2d2;--bad:#b3261e;--badBg:#fce8e6;--info:#175c9a;--infoBg:#e8f1fb;--shadow:0 1px 1px rgba(34,28,16,.05),0 10px 28px rgba(34,28,16,.08);--shadow2:0 1px 0 rgba(255,255,255,.75) inset,0 24px 70px rgba(34,28,16,.14)}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#0d1110;--bg2:#11191a;--surface:#151a18;--surface2:#1d2421;--surface3:#14261f;--text:#f3efe5;--muted:#a7b4ad;--line:#2b342f;--line2:#435047;--primary:#63d3b1;--primary2:#9ce6cf;--primaryText:#08100d;--accent:#f3a45d;--accent2:#8dc7ff;--ok:#69d391;--okBg:#143120;--warn:#f2c45c;--warnBg:#32270f;--bad:#ff8c82;--badBg:#351a18;--info:#8dc7ff;--infoBg:#13283a;--shadow:0 1px 2px rgba(0,0,0,.32);--shadow2:0 1px 0 rgba(255,255,255,.04) inset,0 26px 80px rgba(0,0,0,.38)}
+*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at top left,color-mix(in srgb,var(--surface3) 58%,transparent),transparent 36rem),linear-gradient(135deg,var(--bg),var(--bg2));color:var(--text);font:14px/1.48 Aptos,"IBM Plex Sans","Segoe UI",sans-serif;letter-spacing:0}body:before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background-image:linear-gradient(color-mix(in srgb,var(--line) 48%,transparent) 1px,transparent 1px),linear-gradient(90deg,color-mix(in srgb,var(--line) 42%,transparent) 1px,transparent 1px);background-size:48px 48px;mask-image:linear-gradient(to bottom,rgba(0,0,0,.55),transparent 78%)}a{color:var(--primary2);text-decoration:none}a:hover{text-decoration:underline;text-underline-offset:3px}
+.topbar{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:18px;min-height:64px;padding:0 28px;background:color-mix(in srgb,var(--surface) 86%,transparent);border-bottom:1px solid var(--line);backdrop-filter:saturate(140%) blur(18px);box-shadow:0 1px 0 color-mix(in srgb,var(--text) 5%,transparent)}.brand{display:flex;align-items:center;gap:12px;min-width:250px;color:var(--text)}.brand:hover{text-decoration:none}.brand-mark{display:grid;place-items:center;width:36px;height:36px;border-radius:7px;background:linear-gradient(135deg,var(--primary),var(--accent2));color:var(--primaryText);font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-weight:900;font-size:12px;box-shadow:0 10px 24px color-mix(in srgb,var(--primary) 26%,transparent)}.brand-name{display:block;font-size:15px;font-weight:820}.brand-sub{display:block;font-size:11px;color:var(--muted);margin-top:1px}.topnav{display:flex;gap:4px;flex:1}.topnav a{color:var(--muted);padding:8px 11px;border-radius:7px;font-weight:760;font-size:13px}.topnav a:hover{background:var(--surface2);color:var(--text);text-decoration:none}.theme-toggle{width:auto;flex:0 0 auto;display:inline-flex;align-items:center;border:1px solid var(--line2);background:var(--surface);color:var(--text);border-radius:999px;padding:8px 12px;font-weight:820;font-size:12px;box-shadow:var(--shadow)}
+.page{max-width:1480px;margin:0 auto;padding:28px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:0 0 20px}.eyebrow{font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-size:11px;color:var(--primary);font-weight:900;text-transform:uppercase;letter-spacing:.12em}.page-heading h1{margin:4px 0 0;font-family:Aptos,"IBM Plex Sans","Segoe UI",sans-serif;font-size:30px;line-height:1.08;font-weight:850}.sub{color:var(--muted);margin-top:4px}h1,h2,h3{letter-spacing:0}h2{margin:0;font-size:15px;line-height:1.25;font-weight:850}h3{margin:0 0 8px;font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-size:11px;color:var(--muted);font-weight:900;text-transform:uppercase;letter-spacing:.08em}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.section-head p{margin:4px 0 0;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px}.card{position:relative;background:color-mix(in srgb,var(--surface) 96%,transparent);border:1px solid var(--line);border-radius:9px;padding:16px;box-shadow:var(--shadow);overflow:hidden}.card:after{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,var(--primary),transparent 45%,var(--accent) 100%);opacity:.45}.span3{grid-column:span 3}.span4{grid-column:span 4}.span5{grid-column:span 5}.span6{grid-column:span 6}.span7{grid-column:span 7}.span8{grid-column:span 8}.span12{grid-column:span 12}
+.metric{font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-size:30px;line-height:1.02;font-weight:900;margin-top:8px;letter-spacing:-.02em}.metric.small{font-size:15px;overflow-wrap:anywhere;letter-spacing:0}.metric-label{color:var(--muted);font-size:12px;margin-top:6px}.metric-card{min-height:118px}.muted{color:var(--muted)}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.info{color:var(--info)}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid transparent;border-radius:999px;padding:4px 9px;font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-size:11px;font-weight:900;white-space:nowrap}.status:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 12%,transparent)}.status.ok{background:var(--okBg);color:var(--ok)}.status.warn{background:var(--warnBg);color:var(--warn)}.status.bad{background:var(--badBg);color:var(--bad)}.status.info{background:var(--infoBg);color:var(--info)}.status.neutral{background:var(--surface2);color:var(--muted);border-color:var(--line)}
+.campaign-card{position:relative;background:linear-gradient(135deg,color-mix(in srgb,var(--surface) 94%,transparent),color-mix(in srgb,var(--surface3) 86%,transparent));border:1px solid var(--line);border-radius:10px;padding:20px;box-shadow:var(--shadow2);overflow:hidden}.campaign-card:before{content:"";position:absolute;inset:0;background:linear-gradient(115deg,transparent 0 58%,color-mix(in srgb,var(--primary) 10%,transparent) 58% 66%,transparent 66%);pointer-events:none}.campaign-title{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:18px}.campaign-title h2{font-size:22px}.campaign-title p{margin:5px 0 0;color:var(--muted)}.campaign-metrics{position:relative;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));border:1px solid var(--line);border-radius:9px;overflow:hidden;background:color-mix(in srgb,var(--surface) 88%,transparent)}.campaign-metric{padding:16px;border-right:1px solid var(--line);min-height:108px}.campaign-metric:last-child{border-right:0}.campaign-metric .metric{font-size:27px}.campaign-metric h3{margin-bottom:10px}
+.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:4px 9px;margin:2px;background:var(--surface2);color:var(--muted);font-weight:820;font-size:12px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:9px;background:var(--surface);box-shadow:0 1px 0 color-mix(in srgb,var(--text) 4%,transparent) inset}table{width:100%;border-collapse:collapse;min-width:560px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);background:linear-gradient(180deg,var(--surface2),color-mix(in srgb,var(--surface2) 72%,var(--surface)));font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:900}tr:last-child td{border-bottom:0}tbody tr:hover,table tr:hover td{background:color-mix(in srgb,var(--surface3) 45%,transparent)}td{overflow-wrap:anywhere}code,pre{font-family:"JetBrains Mono","Berkeley Mono","SFMono-Regular",ui-monospace,monospace;background:var(--surface2);border:1px solid var(--line);border-radius:6px}code{padding:2px 6px;font-size:12px}pre{padding:14px;overflow:auto;max-height:520px;white-space:pre-wrap;overflow-wrap:anywhere}
+label{display:block;margin:12px 0 6px;color:var(--muted);font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-weight:900;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em}input,select{width:100%;background:var(--surface);border:1px solid var(--line2);border-radius:7px;color:var(--text);padding:10px 11px;outline:none}input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 16%,transparent)}button,.button{display:inline-flex;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--primary),var(--primary2));border:0;color:var(--primaryText);border-radius:7px;padding:10px 14px;font-weight:860;cursor:pointer;min-height:38px;text-decoration:none;box-shadow:0 10px 22px color-mix(in srgb,var(--primary) 18%,transparent)}button:hover,.button:hover{text-decoration:none;filter:brightness(1.03)}button.secondary,.button.secondary{background:var(--surface);border:1px solid var(--line2);color:var(--text);box-shadow:var(--shadow)}
+.row{display:flex;gap:12px;align-items:end}.row>*{flex:1}.small{font-size:12px}.list{display:grid;gap:9px}.item{display:block;padding:12px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--surface) 88%,transparent)}.item:hover{border-color:var(--line2);box-shadow:var(--shadow);text-decoration:none}.target-item{display:flex;align-items:center;justify-content:space-between;gap:12px}.target-name{font-weight:880}.target-meta{color:var(--muted);font-size:12px;margin-top:3px}.breadcrumb{margin:0 0 18px;color:var(--muted)}.breadcrumb a{font-weight:780}.empty{padding:18px;color:var(--muted);background:color-mix(in srgb,var(--surface2) 82%,transparent);border:1px dashed var(--line2);border-radius:9px}
+details.card{padding:0;overflow:hidden}details.card summary{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 16px;cursor:pointer}details.card summary::-webkit-details-marker{display:none}details.card summary:after{content:"Open";font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace;font-size:10px;color:var(--muted);font-weight:900;text-transform:uppercase;letter-spacing:.08em}details[open].card summary:after{content:"Close"}details.card .details-body{padding:0 16px 16px}
+.nowrap{white-space:nowrap}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.worker-table td:nth-child(2),.worker-table td:nth-child(3),.worker-table td:nth-child(4),.worker-table td:nth-child(5){font-family:"JetBrains Mono","Berkeley Mono",ui-monospace,monospace}.profile-list{display:flex;flex-wrap:wrap;gap:4px}
 @media(max-width:1000px){.span3,.span4,.span5,.span6,.span7,.span8{grid-column:span 12}.campaign-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.campaign-metric{border-bottom:1px solid var(--line)}.campaign-metric:nth-child(2n){border-right:0}.campaign-metric:last-child{border-bottom:0}.page-heading{display:block}.topbar{align-items:flex-start;flex-wrap:wrap;height:auto;padding:12px 16px}.brand{min-width:0;flex:1}.topnav{order:3;width:100%;overflow:auto}.page{padding:18px}.row{display:block}.row>*{margin-bottom:10px}.target-item{align-items:flex-start;display:block}.theme-toggle{margin-left:auto}}
 @media(max-width:620px){.topnav{display:none}.topbar{align-items:center}.campaign-metrics{grid-template-columns:1fr}.campaign-metric{border-right:0;border-bottom:1px solid var(--line)}.campaign-metric:last-child{border-bottom:0}.metric{font-size:24px}.campaign-title{display:block}.campaign-title .status{margin-top:10px}}
 """
@@ -74,288 +76,14 @@ THEME_SCRIPT_BODY = """
 </script>
 """
 
-_PUBLIC_IP_CACHE: tuple[float, str | None] | None = None
-
-
-def lan_ip() -> str:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        sock.close()
-
-
-def public_ip() -> str | None:
-    global _PUBLIC_IP_CACHE
-    now = time.monotonic()
-    if _PUBLIC_IP_CACHE and now - _PUBLIC_IP_CACHE[0] < 600:
-        return _PUBLIC_IP_CACHE[1]
-    value: str | None = None
-    try:
-        with urllib.request.urlopen("https://ifconfig.me/ip", timeout=1.5) as response:
-            text = response.read(128).decode("utf-8", errors="replace").strip()
-            if text and len(text) <= 64:
-                value = text
-    except Exception:
-        value = None
-    _PUBLIC_IP_CACHE = (now, value)
-    return value
-
-
-def _local_listener_ok(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            return True
-    except OSError:
-        return False
-
-
-def _ufw_hint() -> str:
-    try:
-        proc = subprocess.run(
-            ["ufw", "status"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=1.5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "ufw status unavailable; cloud firewall or VPS security-group rules may still block inbound access."
-    text = " ".join(proc.stdout.split())
-    if not text:
-        return "ufw returned no status; cloud firewall or VPS security-group rules may still block inbound access."
-    if "need to be root" in text.lower():
-        return "ufw status requires root here; cloud firewall or VPS security-group rules may still block inbound access."
-    return text[:240]
-
-
-def connectivity_info(host: str, port: int, token_enabled: bool = False) -> dict:
-    private = lan_ip()
-    public = public_ip()
-    ssh_host = public or "<vps-public-ip>"
-    user = getpass.getuser()
-    if host in {"127.0.0.1", "localhost"}:
-        private_url = "not exposed; bound to localhost"
-        public_url = "not exposed; bound to localhost"
-    else:
-        private_url = f"http://{private}:{port}/" if host in {"0.0.0.0", "::", private} else f"http://{host}:{port}/"
-        public_url = f"http://{public}:{port}/" if public else "unknown"
-    return {
-        "bind_host": host,
-        "bind_port": port,
-        "local_url": f"http://127.0.0.1:{port}/",
-        "private_ip": private,
-        "private_url": private_url,
-        "public_ip": public,
-        "public_url": public_url,
-        "listener_ok": _local_listener_ok(port),
-        "ssh_tunnel": f"ssh -L {port}:127.0.0.1:{port} {user}@{ssh_host}",
-        "recommended_url": f"http://127.0.0.1:{port}/",
-        "recommended_access": "SSH tunnel",
-        "token_auth": "enabled" if token_enabled else "disabled",
-        "firewall_hint": _ufw_hint(),
-        "note": (
-            "10.x/172.16-31.x/192.168.x addresses are private. If your browser is not inside the same VNet/VPN, "
-            "use the SSH tunnel even when the dashboard is listening correctly on the VPS."
-        ),
-    }
-
-
-def _safe(path: Path, limit: int = 12000) -> str:
-    if not path.exists() or not path.is_file():
-        return ""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if len(text) > limit:
-        return text[-limit:]
-    return text
-
-
-def _target_runs(workspace: Path, name: str) -> list[str]:
-    runs_dir = workspace / "runs" / name
-    if not runs_dir.exists():
-        return []
-    return sorted([p.name for p in runs_dir.iterdir() if p.is_dir() and p.name != "background"])
-
-
-def _target_hidden(data: dict) -> tuple[bool, str]:
-    if data.get("dashboard_hidden"):
-        return True, str(data.get("dashboard_hidden_reason", "hidden by manifest"))
-    source_path = str(data.get("source_path", ""))
-    if source_path.startswith("fixtures/") or "/fixtures/" in source_path:
-        return True, "lab fixture"
-    return False, ""
-
-
-def _target_findings(workspace: Path, target: str) -> dict:
-    return target_findings(workspace, target)
-
-
-def _targets(workspace: Path) -> tuple[list[dict], list[dict]]:
-    out = []
-    hidden = []
-    targets_dir = workspace / "targets"
-    if not targets_dir.exists():
-        return out, hidden
-    for manifest_path in sorted(targets_dir.glob("*/target.json")):
-        try:
-            data = read_json(manifest_path)
-            name = data["name"]
-            runs = _target_runs(workspace, name)
-            current_run = find_latest_run(workspace, name).name if runs else None
-            target = {
-                "name": name,
-                "manifest": data,
-                "runs": runs,
-                "latest_run": current_run,
-                "findings": _target_findings(workspace, name),
-            }
-            is_hidden, reason = _target_hidden(data)
-            if is_hidden:
-                target["hidden_reason"] = reason
-                hidden.append(target)
-            else:
-                out.append(target)
-        except Exception as exc:
-            out.append({"name": manifest_path.parent.name, "error": str(exc), "runs": []})
-    return out, hidden
-
-
-def _systemd_user_status() -> dict:
-    services = [
-        "fuzz-dashboard.service",
-        "fuzz-dashboard-lan.service",
-        "fuzz-monitor@mdnsresponder.service",
-        "fuzz-campaign@mdnsresponder.service",
-    ]
-    out: dict[str, str] = {}
-    for service in services:
-        try:
-            proc = subprocess.run(
-                ["systemctl", "--user", "is-active", service],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=1.5,
-                check=False,
-            )
-            out[service] = proc.stdout.strip() or f"exit {proc.returncode}"
-        except (OSError, subprocess.TimeoutExpired):
-            out[service] = "unavailable"
-    return out
-
-
-def _supervisor_state(workspace: Path, targets: list[dict]) -> dict:
-    out: dict[str, dict] = {}
-    for target in targets:
-        name = target.get("name")
-        if not name:
-            continue
-        state_file = workspace / "state" / "supervisor" / f"{name}.json"
-        stored = read_json(state_file) if state_file.exists() else {}
-        out[name] = {
-            "state": stored,
-            "active_processes": active_fuzz_processes(workspace, name),
-        }
-    return out
-
-
-def _run_summary(workspace: Path, target: str, run_id: str | None = None) -> dict:
-    run_dir = workspace / "runs" / target / run_id if run_id else find_latest_run(workspace, target)
-    summary = {"target": target, "run_id": run_dir.name, "path": str(run_dir)}
-    triage = run_dir / "triage" / "unique_crashes.json"
-    if triage.exists():
-        summary["triage"] = read_json(triage)
-    guidance = run_dir / "guidance" / "coverage-guidance.md"
-    if guidance.exists():
-        summary["guidance"] = _safe(guidance)
-    coverage = run_dir / "coverage"
-    if coverage.exists():
-        reports = list(coverage.glob("*.report.txt"))
-        summary["coverage_report"] = _safe(reports[0]) if reports else ""
-    monitor = run_dir / "monitor" / "state.json"
-    if monitor.exists():
-        summary["monitor"] = read_json(monitor)
-        summary["snapshot"] = summary["monitor"].get("last_snapshot", {})
-    else:
-        try:
-            summary["snapshot"] = _snapshot(workspace, run_dir)
-        except Exception:
-            summary["snapshot"] = {}
-    coverage_inputs = run_dir / "coverage" / "inputs.json"
-    if coverage_inputs.exists():
-        summary["coverage_inputs"] = read_json(coverage_inputs)
-    corpus_sync = run_dir / "corpus_sync" / "corpus_sync.json"
-    if corpus_sync.exists():
-        summary["corpus_sync"] = read_json(corpus_sync)
-    summary["logs"] = [rel_to(p, workspace) for p in sorted(run_dir.rglob("*.log"))[:20]]
-    summary["reports"] = [rel_to(p, workspace) for p in sorted((run_dir / "reports").glob("*.md"))] if (run_dir / "reports").exists() else []
-    return summary
-
-
 def state(workspace: Path) -> dict:
-    tools = collect_tool_status(workspace)
-    targets, hidden_targets = _targets(workspace)
-    runs = []
-    for target in targets:
-        for run_id in target.get("runs", [])[-10:]:
-            runs.append({"target": target["name"], "run_id": run_id})
-    return {
-        "workspace": str(workspace),
-        "lan_ip": lan_ip(),
-        "connectivity": connectivity_info(Handler.bind_host, Handler.bind_port, bool(Handler.auth_token)),
-        "systemd": _systemd_user_status(),
-        "supervisor": _supervisor_state(workspace, targets),
-        "tools": tools,
-        "targets": targets,
-        "hidden_targets": hidden_targets,
-        "runs": runs[-30:],
-    }
+    return collect_dashboard_state(workspace, Handler.bind_host, Handler.bind_port, bool(Handler.auth_token))
 
 
-def badge(label: object, tone: str = "neutral") -> str:
-    safe_tone = tone if tone in {"ok", "warn", "bad", "info", "neutral"} else "neutral"
-    return f"<span class='status {safe_tone}'>{html.escape(str(label))}</span>"
-
-
-def service_tone(status: object) -> str:
-    value = str(status)
-    if value == "active":
-        return "ok"
-    if value in {"failed", "not-found"}:
-        return "bad"
-    if value in {"inactive", "deactivating", "activating"}:
-        return "warn"
-    return "neutral"
-
-
-def crash_tone(severity: object) -> str:
-    value = str(severity).upper()
-    if value in {"CRITICAL", "HIGH"}:
-        return "bad"
-    if value == "MEDIUM":
-        return "warn"
-    if value in {"LOW", "INFO"}:
-        return "info"
-    return "neutral"
-
-
-def metric_card(title: str, value: object, caption: str, tone: str = "") -> str:
-    tone_class = f" {tone}" if tone else ""
-    return (
-        "<section class='card metric-card span3'>"
-        f"<div class='section-head'><h2>{html.escape(title)}</h2></div>"
-        f"<div class='metric{tone_class}'>{html.escape(str(value))}</div>"
-        f"<div class='metric-label'>{html.escape(caption)}</div>"
-        "</section>"
-    )
-
-
-def table_wrap(table: str) -> str:
-    return f"<div class='table-wrap'>{table}</div>"
+def _redact_log_text(text: str) -> str:
+    text = re.sub(r"([?&]token=)[^&\s]+", r"\1<redacted>", text)
+    text = re.sub(r"(Authorization:\s*Bearer\s+)\S+", r"\1<redacted>", text, flags=re.I)
+    return text
 
 
 def page(title: str, body: str) -> bytes:
@@ -385,7 +113,7 @@ def page(title: str, body: str) -> bytes:
   <main class="page">
     <div class="page-heading">
       <div>
-        <div class="eyebrow">Fuzzing Control Plane</div>
+        <div class="eyebrow">Sanitizer Operations</div>
         <h1>{safe_title}</h1>
       </div>
     </div>
@@ -397,367 +125,19 @@ def page(title: str, body: str) -> bytes:
 
 
 def render_home(workspace: Path) -> bytes:
-    s = state(workspace)
-    tools = s["tools"]
-    conn = s["connectivity"]
-    hidden_count = len(s.get("hidden_targets", []))
-    installed = sum(1 for t in tools["tools"] if t["installed"])
-    total = len(tools["tools"])
-    docker = "ok" if tools["docker_access_ok"] else "blocked"
-    core_pattern = tools.get("core_pattern") or "unknown"
-    core_cls = "warn" if tools.get("core_pattern_warning") else "ok"
-    target_cards = []
-    for t in s["targets"]:
-        latest = t.get("latest_run")
-        target_name = html.escape(t["name"])
-        link = f"<a href='/target/{target_name}' class='target-name'>{target_name}</a>"
-        run = f"<a href='/run/{target_name}/{html.escape(latest)}'>{html.escape(latest)}</a>" if latest else "<span class='muted'>no runs</span>"
-        harnesses = len(t.get("manifest", {}).get("harnesses", []))
-        target_findings_data = t.get("findings") or {}
-        confirmed = int(target_findings_data.get("reproducible", 0) or 0)
-        collapsed = int(target_findings_data.get("duplicate_artifacts", 0) or 0)
-        finding_label = "finding" if confirmed == 1 else "findings"
-        duplicate_note = f", {collapsed} duplicate artifacts collapsed" if collapsed else ""
-        target_cards.append(
-            "<div class='item target-item'>"
-            f"<div>{link}<div class='target-meta'>{harnesses} harnesses, latest {run}{html.escape(duplicate_note)}</div></div>"
-            f"{badge(f'{confirmed} unique {finding_label}', 'bad' if confirmed else 'info')}"
-            "</div>"
-        )
-    body = f"""
-<div class="grid">
-  {render_active_campaigns(workspace, s['targets'], s['supervisor'])}
-  {render_findings_panel(s['targets'])}
-  {metric_card('Toolchain', f'{installed}/{total}', 'curated tools available', 'ok' if installed == total else 'warn')}
-  {metric_card('Docker', docker, tools.get('docker_access_error') or 'ready', 'ok' if docker == 'ok' else 'warn')}
-  {metric_card('Production Targets', len(s['targets']), f'{hidden_count} lab fixtures hidden')}
-  {metric_card('Core Dumps', 'piped' if tools.get('core_pattern_warning') else 'ok', core_pattern[:80], core_cls)}
-  <section class="card span7">
-    <div class="section-head"><div><h2>Production Targets</h2><p>Only real fuzzing targets are listed here. Lab fixtures are hidden from operations.</p></div>{badge(f'{hidden_count} hidden', 'neutral') if hidden_count else ''}</div>
-    <div class="list">{''.join(target_cards) or '<div class="empty">No targets yet.</div>'}</div>
-  </section>
-  <section class="card span5">
-    <div class="section-head"><div><h2>Launch Repository</h2><p>Onboard a new C/C++ target without claiming success before a harness exists.</p></div></div>
-    <form method="post" action="/launch">
-      <label>Git URL or local path</label><input name="source" placeholder="https://github.com/org/repo.git or /path/to/repo" required>
-      <div class="row"><div><label>Name</label><input name="name" placeholder="optional"></div><div><label>Smoke seconds</label><input name="smoke" value="0"></div></div>
-      <button type="submit">Start onboarding</button>
-    </form>
-  </section>
-  <details class="card span12">
-    <summary><div><h2>Connectivity</h2><p>Browser access, tunnel command, and LAN exposure state.</p></div>{badge(conn.get('token_auth', 'unknown'), 'ok' if conn.get('token_auth') == 'enabled' else 'warn')}</summary>
-    <div class="details-body">{render_connectivity(conn)}</div>
-  </details>
-  <details class="card span12">
-    <summary><div><h2>Recovery Services</h2><p>Systemd services and reboot-safe supervisor status.</p></div>{badge('healthy', 'ok') if all(v == 'active' for v in s['systemd'].values()) else badge('check', 'warn')}</summary>
-    <div class="details-body">
-      {render_supervisor_table(s['supervisor'])}
-      <br>
-      {render_systemd_table(s['systemd'])}
-    </div>
-  </details>
-  <details class="card span12">
-    <summary><div><h2>Tool Inventory</h2><p>Installed fuzzing, sanitizer, build, and analysis tools.</p></div>{badge(f'{installed}/{total}', 'ok' if installed == total else 'warn')}</summary>
-    <div class="details-body">{render_tools_table(tools)}</div>
-  </details>
-</div>
-"""
-    return page("Fuzz Pipeline Dashboard", body)
-
-
-def render_connectivity(conn: dict) -> str:
-    rows = [
-        ("Recommended access", conn["recommended_access"]),
-        ("Browser URL after tunnel", conn["recommended_url"]),
-        ("Bind", f"{conn['bind_host']}:{conn['bind_port']}"),
-        ("Private URL", conn["private_url"]),
-        ("Public URL", conn["public_url"]),
-        ("Token auth", conn["token_auth"]),
-        ("Local listener", "ok" if conn["listener_ok"] else "not reachable from localhost"),
-        ("Firewall hint", conn["firewall_hint"]),
-    ]
-    body = "<table><tr><th>Check</th><th>Value</th></tr>"
-    for label, value in rows:
-        if label == "Local listener":
-            value_html = badge(value, "ok" if conn["listener_ok"] else "bad")
-        elif label == "Token auth":
-            value_html = badge(value, "ok" if value == "enabled" else "warn")
-        else:
-            value_html = html.escape(str(value))
-        body += f"<tr><td>{html.escape(label)}</td><td>{value_html}</td></tr>"
-    body = table_wrap(body + "</table>")
-    body += f"<p class='muted'>{html.escape(conn['note'])}</p>"
-    body += f"<h3>SSH Tunnel</h3><pre>{html.escape(conn['ssh_tunnel'])}</pre>"
-    return body
-
-
-def render_tools_table(tools: dict) -> str:
-    rows = []
-    for t in tools["tools"]:
-        cls = "ok" if t["installed"] else ("bad" if t["required"] else "warn")
-        status = "ok" if t["installed"] else "missing"
-        need = "required" if t["required"] else "optional"
-        rows.append(
-            f"<tr><td>{badge(status, cls)}</td><td>{html.escape(t['name'])}</td>"
-            f"<td>{badge(need, 'bad' if t['required'] and not t['installed'] else 'neutral')}</td>"
-            f"<td><code>{html.escape(t.get('path') or '-')}</code></td></tr>"
-        )
-    return table_wrap("<table><tr><th>Status</th><th>Tool</th><th>Need</th><th>Path</th></tr>" + "".join(rows) + "</table>")
-
-
-def render_systemd_table(systemd: dict) -> str:
-    rows = []
-    for name, status in systemd.items():
-        rows.append(f"<tr><td><code>{html.escape(name)}</code></td><td>{badge(status, service_tone(status))}</td></tr>")
-    return table_wrap("<table><tr><th>Service</th><th>Status</th></tr>" + "".join(rows) + "</table>")
-
-
-def render_supervisor_table(supervisor: dict) -> str:
-    rows = []
-    for target, data in sorted(supervisor.items()):
-        state = data.get("state") or {}
-        status = state.get("status", "unknown")
-        active_count = len(data.get("active_processes") or [])
-        cls = "ok" if status in {"running_campaign", "waiting_existing_campaign"} else ("warn" if status != "unknown" else "neutral")
-        detail = ""
-        if state.get("run_ids"):
-            detail = ", ".join(str(item) for item in state.get("run_ids", []))
-        elif state.get("next_check_seconds"):
-            detail = f"next check {state.get('next_check_seconds')}s"
-        rows.append(
-            f"<tr><td>{html.escape(str(target))}</td><td>{badge(status, cls)}</td>"
-            f"<td>{active_count}</td><td>{html.escape(detail)}</td></tr>"
-        )
-    return table_wrap("<table><tr><th>Target</th><th>Status</th><th>Active Processes</th><th>Detail</th></tr>" + "".join(rows) + "</table>")
-
-
-def render_findings_panel(targets: list[dict]) -> str:
-    all_findings = []
-    for target in targets:
-        target_name = str(target.get("name"))
-        for finding in (target.get("findings") or {}).get("findings", []):
-            all_findings.append((target_name, finding))
-    all_findings.sort(
-        key=lambda item: (
-            severity_value(item[1].get("severity")),
-            str(item[1].get("last_seen", item[1].get("run_id", ""))),
-        ),
-        reverse=True,
-    )
-    rows = []
-    for target_name, finding in all_findings[:20]:
-        severity = str(finding.get("severity", "INFO"))
-        report = finding.get("report")
-        finding_id = str(finding.get("id", "unknown"))
-        artifacts = int(finding.get("raw_artifacts", 1) or 1)
-        occurrences = int(finding.get("occurrences", 1) or 1)
-        report_link = (
-            f"<a href='/file/{html.escape(str(report))}'><code>{html.escape(finding_id)}</code></a>"
-            if report else f"<code>{html.escape(finding_id)}</code>"
-        )
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(target_name)}</td>"
-            f"<td>{badge(severity, crash_tone(severity))}</td>"
-            f"<td>{html.escape(str(finding.get('type', 'unknown')))}</td>"
-            f"<td>{html.escape(str(finding.get('harness', 'unknown')))}</td>"
-            f"<td>{artifacts}</td>"
-            f"<td>{occurrences}</td>"
-            f"<td>{report_link}</td>"
-            f"<td><a href='/run/{html.escape(target_name)}/{html.escape(str(finding.get('run_id', '')))}'>{html.escape(str(finding.get('run_id', '')))}</a></td>"
-            "</tr>"
-        )
-    if not rows:
-        return "<section class='card span12'><div class='section-head'><div><h2>Confirmed Findings</h2><p>No sanitizer-reproducible crashes have been triaged yet.</p></div>{}</div></section>".format(badge("0", "neutral"))
-    count_note = "" if len(all_findings) <= len(rows) else f" Showing first {len(rows)}."
-    collapsed = sum(int(finding.get("duplicate_artifacts", 0) or 0) for _, finding in all_findings)
-    duplicate_note = f" {collapsed} duplicate artifacts are collapsed into these rows." if collapsed else ""
-    return (
-        "<section class='card span12'>"
-        "<div class='section-head'><div><h2>Confirmed Findings</h2>"
-        f"<p>Target-wide unique sanitizer states across all runs.{html.escape(duplicate_note + count_note)}</p></div>"
-        f"{badge(str(len(all_findings)), 'bad')}"
-        "</div>"
-        + table_wrap("<table><tr><th>Target</th><th>Severity</th><th>Type</th><th>Harness</th><th>Artifacts</th><th>Runs</th><th>ID / Report</th><th>Latest Run</th></tr>" + "".join(rows) + "</table>")
-        + "</section>"
-    )
-
-
-def render_active_campaigns(workspace: Path, targets: list[dict], supervisor: dict) -> str:
-    cards = []
-    for target in targets:
-        name = str(target.get("name"))
-        run_id = target.get("latest_run")
-        active = (supervisor.get(name) or {}).get("active_processes") or []
-        afl_workers = [p for p in active if p.get("kind") == "afl-fuzz"]
-        run_link = ""
-        execs = paths = raw = "0"
-        worker_text = f"{len(afl_workers)} AFL++"
-        findings = target.get("findings") or {}
-        confirmed = int(findings.get("reproducible", 0) or 0)
-        high_or_critical = int(findings.get("high_or_critical", 0) or 0)
-        collapsed_duplicates = int(findings.get("duplicate_artifacts", 0) or 0)
-        raw_label = "current-run crash artifacts"
-        if run_id:
-            try:
-                snap = _snapshot(workspace, workspace / "runs" / name / str(run_id))
-                execs = f"{int(snap.get('execs', 0)):,}"
-                paths = f"{int(snap.get('paths', 0)):,}"
-                raw = str(snap.get("raw_crashes", 0))
-                raw_label = f"{int(snap.get('duplicate_crashes', 0) or 0)} duplicates after triage"
-                if snap.get("workers_expected"):
-                    worker_text = f"{snap.get('workers_alive', 0)}/{snap.get('workers_expected', 0)} AFL++"
-            except Exception:
-                pass
-            run_link = f"<a href='/run/{html.escape(name)}/{html.escape(str(run_id))}'>{html.escape(str(run_id))}</a>"
-        else:
-            run_link = "<span class='muted'>no runs</span>"
-        status = (supervisor.get(name) or {}).get("state", {}).get("status", "unknown")
-        cards.append(
-            "<section class='campaign-card span12'>"
-            "<div class='campaign-title'>"
-            f"<div><h2>{html.escape(name)}</h2><p>Active run {run_link}</p></div>"
-            f"{badge(status, 'ok' if status in {'running_campaign', 'waiting_existing_campaign'} else 'neutral')}"
-            "</div>"
-            "<div class='campaign-metrics'>"
-            f"<div class='campaign-metric'><h3>Workers</h3><div class='metric'>{html.escape(worker_text)}</div><div class='metric-label'>long-running AFL++ capacity</div></div>"
-            f"<div class='campaign-metric'><h3>Execs</h3><div class='metric'>{execs}</div><div class='metric-label'>total AFL++ executions</div></div>"
-            f"<div class='campaign-metric'><h3>Paths</h3><div class='metric'>{paths}</div><div class='metric-label'>coverage-discovering queue paths</div></div>"
-            f"<div class='campaign-metric'><h3>Unique Findings</h3><div class='metric {'bad' if confirmed else ''}'>{confirmed}</div><div class='metric-label'>{high_or_critical} high/critical, {collapsed_duplicates} duplicates collapsed</div></div>"
-            f"<div class='campaign-metric'><h3>Active Raw</h3><div class='metric {'bad' if raw != '0' else ''}'>{html.escape(raw)}</div><div class='metric-label'>{html.escape(raw_label)}</div></div>"
-            "</div>"
-            "</section>"
-        )
-    return "".join(cards) if cards else "<section class='card span12'><div class='empty'>No production fuzzing targets configured.</div></section>"
+    return page("Fuzz Pipeline Dashboard", render_home_body(workspace, state(workspace)))
 
 
 def render_target(workspace: Path, name: str) -> bytes:
-    manifest = load_manifest(workspace, name)
-    runs_dir = workspace / "runs" / name
-    runs = sorted([p.name for p in runs_dir.iterdir() if p.is_dir() and p.name != "background"]) if runs_dir.exists() else []
-    current_run = find_latest_run(workspace, name).name if runs else None
-    findings = _target_findings(workspace, name)
-    finding_rows = []
-    for finding in findings.get("findings", [])[:10]:
-        severity = str(finding.get("severity", "INFO"))
-        report = finding.get("report")
-        finding_id = str(finding.get("id", "unknown"))
-        artifacts = int(finding.get("raw_artifacts", 1) or 1)
-        occurrences = int(finding.get("occurrences", 1) or 1)
-        report_link = (
-            f"<a href='/file/{html.escape(str(report))}'><code>{html.escape(finding_id)}</code></a>"
-            if report else f"<code>{html.escape(finding_id)}</code>"
-        )
-        finding_rows.append(
-            "<tr>"
-            f"<td>{badge(severity, crash_tone(severity))}</td>"
-            f"<td>{html.escape(str(finding.get('type', 'unknown')))}</td>"
-            f"<td>{html.escape(str(finding.get('harness', 'unknown')))}</td>"
-            f"<td>{artifacts}</td>"
-            f"<td>{occurrences}</td>"
-            f"<td>{report_link}</td>"
-            f"<td><a href='/run/{html.escape(name)}/{html.escape(str(finding.get('run_id', '')))}'>{html.escape(str(finding.get('run_id', '')))}</a></td>"
-            "</tr>"
-        )
-    harness_rows = []
-    for h in manifest.harnesses:
-        harness_rows.append(
-            f"<tr><td><b>{html.escape(h.name)}</b></td><td>{badge(h.type, 'info')}</td>"
-            f"<td><code>{html.escape(str(h.source))}</code></td><td><code>{html.escape(' '.join(h.argv))}</code></td></tr>"
-        )
-    ordered_runs = []
-    if current_run:
-        ordered_runs.append(current_run)
-    ordered_runs.extend([r for r in reversed(runs[-30:]) if r != current_run])
-    run_items = ""
-    for r in ordered_runs:
-        is_current = r == current_run
-        run_items += (
-            "<div class='item target-item'>"
-            f"<div><a class='target-name' href='/run/{html.escape(name)}/{html.escape(r)}'>{html.escape(r)}</a>"
-            f"<div class='target-meta'>{'current active/latest run' if is_current else 'campaign artifacts, monitor state, coverage, and reports'}</div></div>"
-            f"{badge('current' if is_current else 'open', 'ok' if is_current else 'info')}"
-            "</div>"
-        )
-    body = f"""
-<p class="breadcrumb"><a href="/">Dashboard</a> / {html.escape(name)}</p>
-<div class="grid">
-<section class="card metric-card span3"><div class="section-head"><h2>Harnesses</h2></div><div class="metric">{len(manifest.harnesses)}</div><div class="metric-label">configured fuzz entrypoints</div></section>
-<section class="card metric-card span3"><div class="section-head"><h2>Runs</h2></div><div class="metric">{len(runs)}</div><div class="metric-label">stored run directories</div></section>
-<section class="card metric-card span3"><div class="section-head"><h2>Unique Findings</h2></div><div class="metric {'bad' if findings.get('reproducible') else ''}">{findings.get('reproducible', 0)}</div><div class="metric-label">{findings.get('high_or_critical', 0)} high or critical</div></section>
-<section class="card metric-card span3"><div class="section-head"><h2>Duplicates</h2></div><div class="metric {'warn' if findings.get('duplicate_artifacts') else ''}">{findings.get('duplicate_artifacts', 0)}</div><div class="metric-label">raw artifacts collapsed across runs</div></section>
-<section class="card span12"><div class="section-head"><div><h2>Confirmed Findings</h2><p>Deduped by sanitizer state across all runs for this target.</p></div></div>{table_wrap('<table><tr><th>Severity</th><th>Type</th><th>Harness</th><th>Artifacts</th><th>Runs</th><th>ID / Report</th><th>Latest Run</th></tr>' + (''.join(finding_rows) or '<tr><td colspan="7" class="muted">No confirmed findings.</td></tr>') + '</table>')}</section>
-<section class="card span6"><div class="section-head"><div><h2>Manifest</h2><p>Source of truth for build and harness orchestration.</p></div></div><pre>{html.escape(json.dumps(manifest.to_dict(), indent=2))}</pre></section>
-<section class="card span6"><div class="section-head"><div><h2>Harnesses</h2><p>Each file harness can feed AFL++; libFuzzer harnesses run sanitizer smoke campaigns.</p></div></div>{table_wrap('<table><tr><th>Name</th><th>Type</th><th>Source</th><th>Argv</th></tr>' + ''.join(harness_rows) + '</table>')}</section>
-<section class="card span12"><div class="section-head"><div><h2>Runs</h2><p>Latest campaigns and smoke runs for this target.</p></div></div><div class="list">{run_items or '<div class="empty">No runs.</div>'}</div></section>
-</div>
-"""
-    return page(f"Target: {name}", body)
+    return page(f"Target: {name}", render_target_body(workspace, name))
 
 
 def render_run(workspace: Path, target: str, run_id: str) -> bytes:
-    summary = _run_summary(workspace, target, run_id)
-    triage = summary.get("triage", {})
-    crashes = [normalize_crash_item(item) for item in triage.get("crashes", [])]
-    snap = summary.get("snapshot", {})
-    coverage_inputs = summary.get("coverage_inputs", {})
-    corpus_sync = summary.get("corpus_sync", {})
-    duplicate_artifacts = sum(int(c.get("duplicates", 0) or 0) for c in crashes)
-    triaged_raw = int(triage.get("raw_crashes", 0) or snap.get("triaged_raw_crashes", 0) or (len(crashes) + duplicate_artifacts))
-    reproducible_count = sum(1 for c in crashes if c.get("reproducible"))
-    crash_rows = []
-    for c in crashes:
-        sev = str(c.get("severity", "INFO"))
-        crash_rows.append(
-            "<tr>"
-            f"<td>{badge(sev, crash_tone(sev))}</td>"
-            f"<td>{html.escape(str(c.get('type')))}</td>"
-            f"<td>{html.escape(str(c.get('harness', 'unknown')))}</td>"
-            f"<td>{html.escape(str(c.get('raw_artifacts', 1)))}</td>"
-            f"<td>{html.escape(str(c.get('duplicates', 0)))}</td>"
-            f"<td><code>{html.escape(str(c.get('id')))}</code></td>"
-            f"<td>{html.escape(str(c.get('impact')))}</td>"
-            "</tr>"
-        )
-    logs = "".join(f"<div class='item'><a href='/file/{html.escape(p)}'>{html.escape(p)}</a></div>" for p in summary.get("logs", []))
-    reports = "".join(f"<div class='item'><a href='/file/{html.escape(p)}'>{html.escape(p)}</a></div>" for p in summary.get("reports", []))
-    queue_rows = "".join(
-        f"<tr><td>{html.escape(name)}</td><td>{count}</td></tr>"
-        for name, count in sorted((snap.get("queue_by_harness") or {}).items())
-    )
-    input_rows = ""
-    for h in coverage_inputs.get("harnesses", []):
-        input_rows += f"<tr><td>{html.escape(str(h.get('harness')))}</td><td>{html.escape(str(h.get('selected', 0)))}</td><td><code>{html.escape(str(h.get('sources', {}))[:240])}</code></td></tr>"
-    corpus_rows = ""
-    for h in corpus_sync.get("harnesses", []):
-        status = str(h.get("status"))
-        corpus_rows += f"<tr><td>{html.escape(str(h.get('harness')))}</td><td>{badge(status, 'ok' if status == 'ok' else 'warn')}</td><td>{html.escape(str(h.get('output_files', 0)))}</td><td><code>{html.escape(str(h.get('output', '-')))}</code></td></tr>"
-    worker_tone = "ok" if snap.get("workers_expected") and snap.get("workers_alive") == snap.get("workers_expected") else "warn"
-    raw_tone = "bad" if snap.get("raw_crashes") else ""
-    body = f"""
-<p class="breadcrumb"><a href="/">Dashboard</a> / <a href="/target/{html.escape(target)}">{html.escape(target)}</a> / {html.escape(run_id)}</p>
-<div class="grid">
-<section class="card span3"><h2>Run Raw</h2><div class="metric {raw_tone}">{html.escape(str(snap.get('raw_crashes', triaged_raw)))}</div><div class="muted">crash artifacts on disk</div></section>
-<section class="card span3"><h2>Unique States</h2><div class="metric">{len(crashes)}</div><div class="muted">{reproducible_count} sanitizer-reproducible</div></section>
-<section class="card span3"><h2>Duplicates</h2><div class="metric {'warn' if duplicate_artifacts else ''}">{duplicate_artifacts}</div><div class="muted">{triaged_raw} triaged artifacts represented</div></section>
-<section class="card span3"><h2>Workers</h2><div class="metric {worker_tone}">{html.escape(str(snap.get('workers_alive', 0)))}/{html.escape(str(snap.get('workers_expected', 0)))}</div><div class="muted">{'active' if snap.get('active') else 'complete'}</div></section>
-<section class="card span6"><div class="section-head"><div><h2>Actions</h2><p>Common follow-up commands for this run.</p></div></div><pre>bin/fuzzctl --runtime native monitor {html.escape(target)} --run {html.escape(run_id)} --once
-bin/fuzzctl --runtime native coverage {html.escape(target)} --run {html.escape(run_id)} --max-inputs 5000
-bin/fuzzctl --runtime native corpus sync {html.escape(target)} --run {html.escape(run_id)}
-bin/fuzzctl --runtime native report {html.escape(target)} --run {html.escape(run_id)}
-bin/fuzzctl --runtime native guide coverage {html.escape(target)} --run {html.escape(run_id)}</pre></section>
-<section class="card span6"><div class="section-head"><div><h2>Run</h2><p>Run directory, lifecycle state, and execution counters.</p></div>{badge('active' if snap.get('active') else 'complete', 'ok' if snap.get('active') else 'neutral')}</div><div class="metric small">{html.escape(run_id)}</div><div class="muted">{html.escape(summary['path'])}</div><p class="muted">execs {html.escape(str(snap.get('execs', 0)))}; paths {html.escape(str(snap.get('paths', 0)))}</p></section>
-<section class="card span12"><div class="section-head"><div><h2>Unique Crashes</h2><p>One row per sanitizer state; artifact and duplicate columns explain AFL++ crash-file noise.</p></div></div>{table_wrap('<table><tr><th>Severity</th><th>Type</th><th>Harness</th><th>Artifacts</th><th>Duplicates</th><th>ID</th><th>Impact</th></tr>' + (''.join(crash_rows) or '<tr><td colspan="7" class="muted">No triaged crashes.</td></tr>') + '</table>')}</section>
-<section class="card span6"><div class="section-head"><div><h2>AFL Queue</h2><p>Coverage-discovering inputs by harness.</p></div></div>{table_wrap('<table><tr><th>Harness</th><th>Inputs</th></tr>' + (queue_rows or '<tr><td colspan="2" class="muted">No AFL queue found.</td></tr>') + '</table>')}</section>
-<section class="card span6"><div class="section-head"><div><h2>Corpus Sync</h2><p>Minimized corpus promotion state.</p></div></div>{table_wrap('<table><tr><th>Harness</th><th>Status</th><th>Files</th><th>Output</th></tr>' + (corpus_rows or '<tr><td colspan="4" class="muted">No corpus sync yet.</td></tr>') + '</table>')}</section>
-<section class="card span12"><div class="section-head"><div><h2>Coverage Inputs</h2><p>Input sources used for LLVM coverage generation.</p></div></div>{table_wrap('<table><tr><th>Harness</th><th>Selected</th><th>Sources</th></tr>' + (input_rows or '<tr><td colspan="3" class="muted">No queue-based coverage run yet.</td></tr>') + '</table>')}</section>
-<section class="card span6"><div class="section-head"><div><h2>Coverage Guidance</h2><p>Coverage-driven next steps.</p></div></div><pre>{html.escape(summary.get('guidance') or 'No guidance yet.')}</pre></section>
-<section class="card span6"><div class="section-head"><div><h2>Coverage Report</h2><p>LLVM source coverage summary.</p></div></div><pre>{html.escape(summary.get('coverage_report') or 'No coverage report yet.')}</pre></section>
-<section class="card span6"><div class="section-head"><div><h2>Reports</h2><p>Generated Markdown findings and indexes.</p></div></div><div class="list">{reports or '<div class="empty">No reports.</div>'}</div></section>
-<section class="card span6"><div class="section-head"><div><h2>Logs</h2><p>Campaign, harness, and build logs.</p></div></div><div class="list">{logs or '<div class="empty">No logs.</div>'}</div></section>
-</div>
-"""
-    return page(f"Run: {target}/{run_id}", body)
+    return page(f"Run: {target}/{run_id}", render_run_body(workspace, target, run_id))
+
+
+def render_crash_value_detail(workspace: Path, target: str, crash_id: str) -> bytes:
+    return page(f"Crash Value: {target}/{crash_id}", render_crash_value_detail_body(workspace, target, crash_id))
 
 
 def render_file(workspace: Path, rel: str) -> bytes:
@@ -841,10 +221,25 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/connectivity":
                 info = connectivity_info(self.bind_host, self.bind_port, bool(self.auth_token))
                 self._send(json.dumps(info, indent=2, sort_keys=True).encode(), content_type="application/json")
+            elif len(parts) == 2 and parts[0] == "api" and parts[1] == "crash-value":
+                targets, _ = _targets(self.workspace)
+                data = {
+                    "targets": [
+                        {"name": target.get("name"), "crash_value": target.get("crash_value", {})}
+                        for target in targets
+                    ]
+                }
+                self._send(json.dumps(data, indent=2, sort_keys=True).encode(), content_type="application/json")
+            elif len(parts) == 3 and parts[0] == "api" and parts[1] == "crash-value":
+                manifest = load_manifest(self.workspace, unquote(parts[2]))
+                data = _target_crash_value(self.workspace, manifest)
+                self._send(json.dumps(data, indent=2, sort_keys=True).encode(), content_type="application/json")
             elif len(parts) == 2 and parts[0] == "target":
                 self._send(render_target(self.workspace, unquote(parts[1])))
             elif len(parts) == 3 and parts[0] == "run":
                 self._send(render_run(self.workspace, unquote(parts[1]), unquote(parts[2])))
+            elif len(parts) == 3 and parts[0] == "crash":
+                self._send(render_crash_value_detail(self.workspace, unquote(parts[1]), unquote(parts[2])))
             elif len(parts) >= 2 and parts[0] == "file":
                 self._send(render_file(self.workspace, "/".join(parts[1:])))
             else:
@@ -875,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(page("Launch Error", f"<section class='card'><pre>{html.escape(str(exc))}</pre></section>"), status=500)
 
     def log_message(self, fmt: str, *args: object) -> None:
-        print(f"dashboard {self.address_string()} - {fmt % args}")
+        print(f"dashboard {self.address_string()} - {_redact_log_text(fmt % args)}")
 
 
 def serve_dashboard(workspace: Path, host: str, port: int, *, token: str | None = None, token_env: str = "FUZZ_DASHBOARD_TOKEN") -> None:

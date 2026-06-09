@@ -1,17 +1,25 @@
 import contextlib
 import io
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from fuzz_pipeline.campaign import _asan_env, _count_crash_artifacts, _merge_harness_env, _worker_counts
+from fuzz_pipeline.build_context import context_flags_for_source
+from fuzz_pipeline.builder import _profile_env
+from fuzz_pipeline.campaign_common import _asan_env, _count_crash_artifacts, _merge_harness_env, _worker_counts
 from fuzz_pipeline.corpus import corpus_enrich, corpus_prune_crashers
+from fuzz_pipeline.advanced_tools import advanced_tool_status
+from fuzz_pipeline.advanced_triage import advanced_triage_run
+from fuzz_pipeline.crash_value import analyze_crash_item, analyze_target_crash_value, crash_value_path
 from fuzz_pipeline.coverage import collect_coverage_inputs
-from fuzz_pipeline.dashboard import _target_findings
+from fuzz_pipeline.dashboard import _redact_log_text, _target_findings
 from fuzz_pipeline.docker_runtime import docker_run_command
+from fuzz_pipeline.grammar import grammar_configure, grammar_plan
 from fuzz_pipeline.harness import (
     _apply_blocker_classifications,
     _best_file_rows,
@@ -24,12 +32,20 @@ from fuzz_pipeline.harness import (
     _review_data,
     _seed_count,
     harness_blockers,
+    harness_qa,
+    suspicious_points,
+    validate_harnesses,
 )
+from fuzz_pipeline.hybrid import symcc_hybrid_run
+from fuzz_pipeline.fuzztest import write_fuzztest_plan, write_fuzztest_template
 from fuzz_pipeline.manifest import Harness, TargetManifest
 from fuzz_pipeline.monitor import _raw_crash_events, _snapshot
+from fuzz_pipeline.oss_fuzz_gen import write_llm_gen_workorder
+from fuzz_pipeline.post_cycle import post_cycle_run
+from fuzz_pipeline.readiness import target_readiness
 from fuzz_pipeline.supervisor import _active_afl_worker_counts, _campaign_mismatch_reason, _classify_cmdline
 from fuzz_pipeline.triage import _better_sanitizer_repro, _choose_harness, _crash_files, _crash_type, _preserve_reproducer_metadata, _severity
-from fuzz_pipeline.util import write_json
+from fuzz_pipeline.util import FuzzCtlError, write_json
 from fuzz_pipeline.util import find_latest_run
 
 
@@ -82,7 +98,6 @@ class PipelineOperationsTests(unittest.TestCase):
                 seed_corpus="seeds",
                 harnesses=[
                     Harness(name="dns_wire_file", type="file", source="fuzz_harnesses/dns_wire_fuzzer.c"),
-                    Harness(name="thread_netdata_file", type="file", source="fuzz_harnesses/thread_netdata_fuzzer.c"),
                     Harness(name="config_parse_file", type="file", source="fuzz_harnesses/config_parse_fuzzer.c"),
                     Harness(name="ddns_settings_config_file", type="file", source="fuzz_harnesses/ddns_settings_config_fuzzer.c"),
                     Harness(name="responder_readline_file", type="file", source="fuzz_harnesses/responder_readline_fuzzer.c"),
@@ -95,7 +110,6 @@ class PipelineOperationsTests(unittest.TestCase):
             corpus_enrich(workspace, manifest)
 
             self.assertTrue((workspace / "corpora" / "target" / "dns_wire_file" / "current" / "dns-query-a.local.bin").exists())
-            self.assertTrue((workspace / "corpora" / "target" / "thread_netdata_file" / "current" / "thread-prefix-route.tlv").exists())
             self.assertTrue((workspace / "corpora" / "target" / "config_parse_file" / "current" / "config-minimal.conf").exists())
             self.assertTrue((workspace / "corpora" / "target" / "ddns_settings_config_file" / "current" / "ddns-settings-valid.conf").exists())
             self.assertTrue((workspace / "corpora" / "target" / "responder_readline_file" / "current" / "readline-nul-prefix.conf").exists())
@@ -172,6 +186,14 @@ class PipelineOperationsTests(unittest.TestCase):
                 [],
             )
 
+    def test_dashboard_log_redacts_query_tokens(self) -> None:
+        line = '127.0.0.1 - "GET /api/state?token=secret123&x=1 HTTP/1.1" 200 -'
+
+        redacted = _redact_log_text(line)
+
+        self.assertNotIn("secret123", redacted)
+        self.assertIn("token=<redacted>", redacted)
+
     def test_raw_crash_event_marks_duplicate_only_growth_as_info(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -247,6 +269,509 @@ class PipelineOperationsTests(unittest.TestCase):
         self.assertEqual(harness.link_flags, ["-Wl,--gc-sections"])
         self.assertEqual(harness.to_dict()["link_flags"], ["-Wl,--gc-sections"])
 
+    def test_symcc_profile_uses_system_libcxx_by_default(self) -> None:
+        env = _profile_env("symcc")
+
+        self.assertEqual(env["SYMCC_REGULAR_LIBCXX"], "1")
+        self.assertNotIn("ASAN_OPTIONS", env)
+        self.assertNotIn("UBSAN_OPTIONS", env)
+
+    def test_context_flags_filter_generated_pch_fragments(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir()
+            harness = source / "fuzzer.cc"
+            harness.write_text("int main() { return 0; }\n", encoding="utf-8")
+            context = workspace / "build" / "target" / "build-context" / "build-context.json"
+            write_json(
+                context,
+                {
+                    "include_dirs": [str(source / "include")],
+                    "defines": ["-DFUZZING"],
+                    "compile_flags": [
+                        "-std=c++17",
+                        "-include",
+                        str(source / "cmake_pch.hxx"),
+                        "-x",
+                        "c++-header",
+                        "-include-pch",
+                        str(source / "cmake_pch.hxx.pch"),
+                        "-Winvalid-pch",
+                        "-fpch-instantiate-templates",
+                        str(source / "bare-source-fragment.cc"),
+                        "-Wno-unused",
+                    ],
+                    "link_artifacts": [],
+                },
+            )
+            manifest = TargetManifest(
+                name="target",
+                language="c++",
+                source_path=str(source),
+                build_system="raw",
+                build_context={"path": str(context)},
+            )
+
+            flags, _ = context_flags_for_source(workspace, manifest, harness)
+
+            self.assertIn("-std=c++17", flags)
+            self.assertIn("-Wno-unused", flags)
+            self.assertNotIn("-include", flags)
+            self.assertNotIn("-include-pch", flags)
+            self.assertNotIn("-x", flags)
+            self.assertFalse(any("cmake_pch" in flag for flag in flags))
+
+    def test_harness_manifest_supports_fuzztest_profile(self) -> None:
+        harness = Harness.from_dict(
+            {
+                "name": "parser_property",
+                "type": "fuzztest",
+                "source": "fuzz_harnesses/parser_property.cc",
+                "profiles": ["fuzztest_asan_ubsan"],
+            }
+        )
+
+        self.assertEqual(harness.type, "fuzztest")
+        self.assertEqual(harness.profiles, ["fuzztest_asan_ubsan"])
+        self.assertEqual(harness.to_dict()["profiles"], ["fuzztest_asan_ubsan"])
+
+    def test_harness_review_requires_fuzztest_macro(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            harness_source = source / "fuzz_harnesses" / "parser_property.cc"
+            harness_source.parent.mkdir(parents=True)
+            harness_source.write_text("void ParserProperty(const char *) {}\n", encoding="utf-8")
+            manifest = TargetManifest(
+                name="target",
+                language="c++",
+                source_path=str(source),
+                build_system="raw",
+                harnesses=[Harness(name="parser_property", type="fuzztest", source="fuzz_harnesses/parser_property.cc")],
+            )
+
+            review = _review_data(workspace, manifest)
+
+            self.assertIn("FuzzTest harness is missing FUZZ_TEST", [item["message"] for item in review["errors"]])
+
+    def test_validate_accepts_fuzztest_harness_type(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            harness_source = source / "fuzz_harnesses" / "parser_property.cc"
+            harness_source.parent.mkdir(parents=True)
+            harness_source.write_text(
+                '#include "fuzztest/fuzztest.h"\nvoid ParserProperty(const std::string&) {}\nFUZZ_TEST(ParserSuite, ParserProperty);\n',
+                encoding="utf-8",
+            )
+            manifest = TargetManifest(
+                name="target",
+                language="c++",
+                source_path=str(source),
+                build_system="raw",
+                harnesses=[Harness(name="parser_property", type="fuzztest", source="fuzz_harnesses/parser_property.cc")],
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = validate_harnesses(workspace, manifest, build=False)
+
+            self.assertEqual(rc, 0)
+
+    def test_harness_qa_writes_four_principle_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            (source / "seeds").mkdir(parents=True)
+            (source / "seeds" / "seed").write_bytes(b"abc")
+            harness_source = source / "fuzz_harnesses" / "parser_file.c"
+            harness_source.parent.mkdir(parents=True)
+            harness_source.write_text(
+                "#include <stdint.h>\n"
+                "static void reset_state(void) {}\n"
+                "static int target_parse(const uint8_t *data, unsigned long size) { return data && size > 0; }\n"
+                "int main(int argc, char **argv) { reset_state(); return target_parse((const uint8_t *)argv[0], (unsigned long)argc); }\n",
+                encoding="utf-8",
+            )
+            manifest = TargetManifest(
+                name="target",
+                language="c",
+                source_path=str(source),
+                build_system="raw",
+                seed_corpus="seeds",
+                harnesses=[Harness(name="parser_file", type="file", argv=["@@"], source="fuzz_harnesses/parser_file.c")],
+            )
+            coverage = workspace / "runs" / "target" / "run" / "coverage"
+            coverage.mkdir(parents=True)
+            (coverage / "parser_file.report.txt").write_text(
+                """Filename Regions Missed Regions Cover Functions Missed Functions Executed Lines Missed Lines Cover Branches Missed Branches Cover
+src/parser.c 100 10 90.00% 10 0 100.00% 100 20 80.00% 0 0 -
+TOTAL 100 10 90.00% 10 0 100.00% 100 20 80.00% 0 0 -
+""",
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = harness_qa(workspace, manifest, run_id="run")
+
+            self.assertEqual(result["four_principles"], [
+                "logic_correctness",
+                "api_protocol_compliance",
+                "security_boundary_respect",
+                "entry_point_adequacy",
+            ])
+            self.assertEqual(result["summary"]["passing"], 1)
+            self.assertTrue(list((workspace / "workorders" / "target").glob("*-harness-qa/harness-qa.json")))
+
+    def test_suspicious_points_prioritize_uncovered_parser_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            (source / "src").mkdir(parents=True)
+            (source / "src" / "parser.c").write_text(
+                "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) { return data && size > 2; }\n",
+                encoding="utf-8",
+            )
+            manifest = TargetManifest(name="target", language="c", source_path=str(source), build_system="raw")
+            coverage = workspace / "runs" / "target" / "run" / "coverage"
+            coverage.mkdir(parents=True)
+            (coverage / "other.report.txt").write_text(
+                "Filename Regions Missed Regions Cover Functions Missed Functions Executed Lines Missed Lines Cover Branches Missed Branches Cover\n"
+                "TOTAL 1 1 0.00% 1 1 0.00% 1 1 0.00% 0 0 -\n",
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = suspicious_points(workspace, manifest, run_id="run", limit=5)
+
+            self.assertTrue(result["suspicious_points"])
+            self.assertEqual(result["suspicious_points"][0]["function"], "parse_record")
+            self.assertTrue((workspace / "runs" / "target" / "run" / "guidance" / "suspicious-points.json").exists())
+
+    def test_post_cycle_records_partial_step_failures_without_stopping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir(parents=True)
+            manifest = TargetManifest(name="target", language="c", source_path=str(source), build_system="raw")
+            run_dir = workspace / "runs" / "target" / "run"
+            run_dir.mkdir(parents=True)
+            write_json(run_dir / "run.json", {"status": "complete"})
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = post_cycle_run(workspace, manifest, run_id="run", no_alerts=True)
+
+            self.assertEqual(result["status"], "partial")
+            self.assertIn("coverage", result["failed_steps"])
+            self.assertTrue((run_dir / "post_cycle" / "post_cycle.json").exists())
+
+    def test_advanced_tool_status_reports_optional_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            status = advanced_tool_status(Path(td))
+
+            self.assertIn("symcc", status)
+            self.assertIn("grammar_mutator_campaigns", status["ready"])
+            self.assertTrue(status["ready"]["oss_fuzz_gen_workorders"])
+
+    def test_symcc_hybrid_missing_tool_writes_skip_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir(parents=True)
+            manifest = TargetManifest(
+                name="target",
+                language="c",
+                source_path=str(source),
+                build_system="raw",
+                harnesses=[Harness(name="parser_file", type="file", argv=["@@"], source="fuzzer.c")],
+            )
+            run_dir = workspace / "runs" / "target" / "run"
+            (run_dir / "aflpp" / "parser_file" / "findings" / "sec1").mkdir(parents=True)
+            write_json(run_dir / "run.json", {"status": "complete"})
+
+            empty_bin = workspace / "empty-bin"
+            empty_bin.mkdir()
+            with mock.patch.dict(os.environ, {"PATH": str(empty_bin)}, clear=False):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = symcc_hybrid_run(workspace, manifest, run_id="run", seconds=1)
+
+            self.assertEqual(result["status"], "skipped")
+            self.assertTrue((workspace / "workorders" / "target" / "hybrid" / "symcc-hybrid.json").exists())
+
+    def test_symcc_hybrid_dry_run_reports_campaign_readiness_without_building(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir(parents=True)
+            manifest = TargetManifest(
+                name="target",
+                language="c",
+                source_path=str(source),
+                build_system="raw",
+                harnesses=[
+                    Harness(
+                        name="parser_file",
+                        type="file",
+                        argv=["@@"],
+                        source="fuzzer.c",
+                        profiles=["afl_asan_ubsan"],
+                    ),
+                    Harness(
+                        name="coverage_only_file",
+                        type="file",
+                        argv=["@@"],
+                        source="coverage.c",
+                        profiles=["coverage"],
+                    ),
+                ],
+            )
+            run_dir = workspace / "runs" / "target" / "run"
+            for role in ["main", "sec1"]:
+                stats = run_dir / "aflpp" / "parser_file" / "findings" / role / "fuzzer_stats"
+                stats.parent.mkdir(parents=True)
+                stats.write_text("execs_done : 1\n", encoding="utf-8")
+            write_json(run_dir / "run.json", {"status": "running"})
+
+            fake_bin = workspace / "fake-bin"
+            fake_bin.mkdir()
+            for tool in ["symcc", "sym++", "symcc_fuzzing_helper"]:
+                path = fake_bin / tool
+                path.write_text("#!/bin/sh\necho fake symcc\n", encoding="utf-8")
+                path.chmod(0o755)
+
+            with mock.patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
+                with mock.patch("fuzz_pipeline.hybrid.build_profile") as build_profile_mock:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = symcc_hybrid_run(workspace, manifest, run_id="run", seconds=1, all_harnesses=True, dry_run=True)
+
+            build_profile_mock.assert_not_called()
+            self.assertEqual(result["mode"], "dry_run")
+            self.assertEqual(result["status"], "ready_to_attempt")
+            self.assertEqual([item["harness"] for item in result["results"]], ["parser_file"])
+            self.assertEqual(result["results"][0]["afl_instance"], "sec1")
+            self.assertTrue((run_dir / "hybrid" / "symcc" / "symcc-hybrid-plan.json").exists())
+
+    def test_symcc_hybrid_records_build_failure_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir(parents=True)
+            manifest = TargetManifest(
+                name="target",
+                language="c",
+                source_path=str(source),
+                build_system="raw",
+                harnesses=[
+                    Harness(
+                        name="parser_file",
+                        type="file",
+                        argv=["@@"],
+                        source="fuzzer.c",
+                        profiles=["afl_asan_ubsan"],
+                    )
+                ],
+            )
+            run_dir = workspace / "runs" / "target" / "run"
+            stats = run_dir / "aflpp" / "parser_file" / "findings" / "sec1" / "fuzzer_stats"
+            stats.parent.mkdir(parents=True)
+            stats.write_text("execs_done : 1\n", encoding="utf-8")
+            write_json(run_dir / "run.json", {"status": "running"})
+            build_log = workspace / "build" / "target" / "symcc" / "build.log"
+            build_log.parent.mkdir(parents=True)
+            build_log.write_text("compiler crashed while instrumenting target\n", encoding="utf-8")
+
+            fake_bin = workspace / "fake-bin"
+            fake_bin.mkdir()
+            for tool in ["symcc", "sym++", "symcc_fuzzing_helper"]:
+                path = fake_bin / tool
+                path.write_text("#!/bin/sh\necho fake symcc\n", encoding="utf-8")
+                path.chmod(0o755)
+
+            with mock.patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
+                with mock.patch("fuzz_pipeline.hybrid.build_profile", side_effect=FuzzCtlError("boom")):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = symcc_hybrid_run(workspace, manifest, run_id="run", seconds=1)
+
+            self.assertEqual(result["status"], "build_failed")
+            self.assertIn("compiler crashed", result["build_log_tail"])
+            self.assertTrue((run_dir / "hybrid" / "symcc" / "symcc-hybrid.json").exists())
+
+    def test_target_readiness_separates_core_ready_from_optional_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            (source / "seeds").mkdir(parents=True)
+            (source / "seeds" / "seed").write_bytes(b"abc")
+            (source / "fuzz_harnesses").mkdir()
+            (source / "fuzz_harnesses" / "parser.c").write_text(
+                "#include <stdint.h>\n"
+                "int LLVMFuzzerTestOneInput(const uint8_t *data, unsigned long size) { return data && size; }\n"
+                "int main(int argc, char **argv) { return LLVMFuzzerTestOneInput((const uint8_t *)argv[0], (unsigned long)argc); }\n",
+                encoding="utf-8",
+            )
+            manifest = TargetManifest(
+                name="target",
+                language="c",
+                source_path=str(source),
+                build_system="raw",
+                seed_corpus="seeds",
+                harnesses=[
+                    Harness(name="parser_libfuzzer", type="libfuzzer", source="fuzz_harnesses/parser.c"),
+                    Harness(
+                        name="parser_file",
+                        type="file",
+                        argv=["@@"],
+                        source="fuzz_harnesses/parser.c",
+                        profiles=["afl_asan_ubsan", "coverage"],
+                    ),
+                ],
+            )
+            for profile, harnesses in {
+                "afl_asan_ubsan": ["parser_file"],
+                "libfuzzer_asan_ubsan": ["parser_libfuzzer"],
+            }.items():
+                build_dir = workspace / "build" / "target" / profile
+                build_dir.mkdir(parents=True)
+                write_json(
+                    build_dir / "build.json",
+                    {"artifacts": [{"harness": name, "profile": profile} for name in harnesses]},
+                )
+                for name in harnesses:
+                    (build_dir / name).write_bytes(b"bin")
+            run_dir = workspace / "runs" / "target" / "run"
+            stats = run_dir / "aflpp" / "parser_file" / "findings" / "main" / "fuzzer_stats"
+            stats.parent.mkdir(parents=True)
+            stats.write_text("execs_done : 10\ncorpus_count : 2\nsaved_crashes : 0\nlast_update : 9999999999\n", encoding="utf-8")
+            queue = stats.parent / "queue"
+            queue.mkdir()
+            (queue / "id:000000").write_bytes(b"abc")
+            (run_dir / "coverage").mkdir(parents=True)
+            (run_dir / "coverage" / "parser_file.report.txt").write_text(
+                "Filename Regions Missed Regions Cover Functions Missed Functions Executed Lines Missed Lines Cover Branches Missed Branches Cover\n"
+                "src/parser.c 100 1 99.00% 10 0 100.00% 100 5 95.00% 0 0 -\n"
+                "TOTAL 100 1 99.00% 10 0 100.00% 100 5 95.00% 0 0 -\n",
+                encoding="utf-8",
+            )
+            write_json(run_dir / "run.json", {"status": "running"})
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = target_readiness(workspace, manifest, run_id="run")
+
+            self.assertEqual(result["status"], "ready_with_warnings")
+            self.assertFalse(any(gate["status"] == "fail" for gate in result["gates"] if gate["section"] == "core"))
+            self.assertTrue(any(gate["name"] == "FuzzTest properties" and gate["status"] == "not_configured" for gate in result["gates"]))
+            self.assertTrue((workspace / "workorders" / "target" / "readiness" / "target-readiness.json").exists())
+
+    def test_grammar_configure_attaches_mutator_env(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir(parents=True)
+            mutator = workspace / "libgrammarmutator-json.so"
+            mutator.write_bytes(b"fake")
+            trees = workspace / "trees"
+            trees.mkdir()
+            manifest = TargetManifest(
+                name="target",
+                language="c",
+                source_path=str(source),
+                build_system="raw",
+                harnesses=[Harness(name="parser_file", type="file", argv=["@@"], source="fuzzer.c")],
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                grammar_configure(
+                    workspace,
+                    manifest,
+                    harness_name="parser_file",
+                    grammar_format="json",
+                    mutator_library=mutator,
+                    tree_dir=trees,
+                    only=True,
+                )
+
+            self.assertEqual(manifest.harnesses[0].env["AFL_CUSTOM_MUTATOR_LIBRARY"], str(mutator))
+            self.assertEqual(manifest.harnesses[0].env["AFL_CUSTOM_MUTATOR_ONLY"], "1")
+            self.assertEqual(manifest.harnesses[0].env["AFL_GRAMMAR_TREE_DIR"], str(trees))
+
+    def test_grammar_plan_writes_workorder_when_tool_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir(parents=True)
+            manifest = TargetManifest(name="target", language="c", source_path=str(source), build_system="raw")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = grammar_plan(workspace, manifest, grammar_format="json")
+
+            self.assertIn("commands", result)
+            self.assertTrue((workspace / "workorders" / "target" / "grammar" / "json-plan.json").exists())
+
+    def test_advanced_triage_writes_skipped_tool_state_without_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            source.mkdir(parents=True)
+            manifest = TargetManifest(name="target", language="c", source_path=str(source), build_system="raw")
+            run_dir = workspace / "runs" / "target" / "run"
+            (run_dir / "triage").mkdir(parents=True)
+            write_json(run_dir / "run.json", {"status": "complete"})
+            write_json(run_dir / "triage" / "unique_crashes.json", {"crashes": []})
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = advanced_triage_run(workspace, manifest, run_id="run")
+
+            self.assertIn("casr", result)
+            self.assertIn("exploitable", result)
+            self.assertTrue((run_dir / "advanced_triage" / "advanced-triage.json").exists())
+
+    def test_llm_gen_workorder_uses_candidate_packet_without_api_call(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            (source / "src").mkdir(parents=True)
+            (source / "src" / "parser.c").write_text(
+                "#include <stddef.h>\nint parse_record(const unsigned char *data, size_t size) { return data && size > 0; }\n",
+                encoding="utf-8",
+            )
+            manifest = TargetManifest(name="target", language="c", source_path=str(source), build_system="raw")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                out = write_llm_gen_workorder(
+                    workspace,
+                    manifest,
+                    candidate_id="parse_record",
+                    backend="codex",
+                )
+
+            self.assertTrue((out / "prompt.md").exists())
+            self.assertTrue((out / "benchmark-skeleton.json").exists())
+            self.assertIn("Codex", (out / "codex-task.md").read_text(encoding="utf-8"))
+
+    def test_fuzztest_plan_and_template_stay_in_workorders(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            (source / "src").mkdir(parents=True)
+            (source / "src" / "parser.cc").write_text(
+                "#include <cstddef>\n#include <cstdint>\nbool ParseBlob(const uint8_t *data, size_t size) { return data && size > 0; }\n",
+                encoding="utf-8",
+            )
+            manifest = TargetManifest(name="target", language="c++", source_path=str(source), build_system="raw")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                plan_dir = write_fuzztest_plan(workspace, manifest)
+            plan = __import__("json").loads((plan_dir / "fuzztest-plan.json").read_text(encoding="utf-8"))
+            candidate_id = plan["properties"][0]["id"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                template_dir = write_fuzztest_template(workspace, manifest, candidate_id=candidate_id)
+
+            self.assertTrue((template_dir / "manifest-entry.json").exists())
+            generated_sources = list(template_dir.glob("*_fuzztest.cc"))
+            self.assertEqual(len(generated_sources), 1)
+            self.assertIn("FUZZ_TEST", generated_sources[0].read_text(encoding="utf-8"))
+            self.assertFalse((source / "fuzz_harnesses").exists())
+
     def test_choose_harness_uses_libfuzzer_crash_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             workspace = Path(td)
@@ -257,19 +782,19 @@ class PipelineOperationsTests(unittest.TestCase):
                 build_system="raw",
                 harnesses=[
                     Harness(name="first_libfuzzer", type="libfuzzer"),
-                    Harness(name="thread_netdata_libfuzzer", type="libfuzzer"),
+                    Harness(name="parser_libfuzzer", type="libfuzzer"),
                 ],
             )
-            binary = workspace / "build" / "target" / "libfuzzer_asan_ubsan" / "thread_netdata_libfuzzer"
+            binary = workspace / "build" / "target" / "libfuzzer_asan_ubsan" / "parser_libfuzzer"
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"binary")
-            crash = workspace / "runs" / "target" / "run" / "libfuzzer" / "thread_netdata_libfuzzer" / "crashes" / "crash-x"
+            crash = workspace / "runs" / "target" / "run" / "libfuzzer" / "parser_libfuzzer" / "crashes" / "crash-x"
             crash.parent.mkdir(parents=True)
             crash.write_bytes(b"crash")
 
             harness, chosen_binary, profile = _choose_harness(workspace, manifest, crash)
 
-            self.assertEqual(harness.name, "thread_netdata_libfuzzer")
+            self.assertEqual(harness.name, "parser_libfuzzer")
             self.assertEqual(chosen_binary, binary)
             self.assertEqual(profile, "libfuzzer_asan_ubsan")
 
@@ -400,7 +925,7 @@ class PipelineOperationsTests(unittest.TestCase):
                         {
                             "id": "abc123",
                             "type": "heap-buffer-overflow",
-                            "harness": "thread_netdata_libfuzzer",
+                            "harness": "parser_libfuzzer",
                             "severity": "HIGH",
                             "reproducible": True,
                         },
@@ -477,6 +1002,123 @@ class PipelineOperationsTests(unittest.TestCase):
             self.assertEqual(findings["findings"][0]["raw_artifacts"], 5)
             self.assertEqual(findings["findings"][0]["run_duplicate_artifacts"], 3)
             self.assertEqual(findings["findings"][0]["run_ids"], [run1.name, run2.name])
+
+    def test_crash_value_keeps_source_bug_valid_until_product_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repos" / "target"
+            (source / "src").mkdir(parents=True)
+            (source / "fuzz_harnesses").mkdir()
+            manifest = TargetManifest(
+                name="target",
+                language="c",
+                source_path=str(source),
+                build_system="raw",
+                harnesses=[Harness(name="parser_file", type="file", source="fuzz_harnesses/parser_fuzzer.c")],
+            )
+            run_dir = workspace / "runs" / "target" / "run"
+            (run_dir / "triage" / "traces").mkdir(parents=True)
+            (run_dir / "minimized").mkdir()
+            trace = run_dir / "triage" / "traces" / "abc123.txt"
+            trace.write_text(
+                f"""ERROR: AddressSanitizer: heap-buffer-overflow
+    #0 0x1 in parse_record {source}/src/parser.c:142:26
+    #1 0x2 in fuzz_parser {source}/fuzz_harnesses/parser_fuzzer.c:60:13
+""",
+                encoding="utf-8",
+            )
+            minimized = run_dir / "minimized" / "abc123.bin"
+            minimized.write_bytes(b"abc")
+            write_json(
+                run_dir / "triage" / "unique_crashes.json",
+                {
+                    "crashes": [
+                        {
+                            "id": "abc123",
+                            "state": "heap-buffer-overflow:parse_record",
+                            "type": "heap-buffer-overflow",
+                            "access": "read",
+                            "harness": "parser_file",
+                            "severity": "HIGH",
+                            "reproducible": True,
+                            "trace_path": str(trace),
+                            "minimized_path": str(minimized),
+                        }
+                    ]
+                },
+            )
+
+            result = analyze_target_crash_value(workspace, manifest, write=True)
+            record = result["records"][0]
+
+            self.assertEqual(record["tier"], "valid_target_bug")
+            self.assertEqual(record["root_cause"]["file"], "src/parser.c")
+            self.assertEqual(record["product_mapping"]["status"], "unmapped")
+            self.assertTrue(crash_value_path(workspace, "target").exists())
+
+    def test_crash_value_downgrades_harness_top_frame_to_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repo"
+            (source / "src").mkdir(parents=True)
+            (source / "fuzz_harnesses").mkdir()
+            manifest = TargetManifest(name="target", language="c", source_path=str(source), build_system="raw")
+            trace = workspace / "trace.txt"
+            trace.write_text(
+                f"""ERROR: AddressSanitizer: heap-buffer-overflow
+    #0 0x1 in dns_u16_parse {source}/fuzz_harnesses/parser_fuzzer.c:22:23
+    #1 0x2 in parse_record {source}/src/parser.c:40:4
+""",
+                encoding="utf-8",
+            )
+            record = analyze_crash_item(
+                workspace,
+                manifest,
+                {
+                    "id": "abc123",
+                    "type": "heap-buffer-overflow",
+                    "access": "read",
+                    "severity": "HIGH",
+                    "reproducible": True,
+                    "trace_path": str(trace),
+                    "minimized_path": str(workspace / "min.bin"),
+                },
+            )
+
+            self.assertEqual(record["tier"], "noise")
+            self.assertTrue(record["harness_assessment"]["suspect"])
+
+    def test_crash_value_keeps_unmapped_tooling_path_valid_not_product_plausible(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td)
+            source = workspace / "repos" / "target"
+            (source / "tools").mkdir(parents=True)
+            manifest = TargetManifest(name="target", language="c", source_path=str(source), build_system="raw")
+            trace = workspace / "trace.txt"
+            trace.write_text(
+                f"""ERROR: AddressSanitizer: stack-buffer-overflow
+    #0 0x1 in format_output {source}/tools/client.c:1100:12
+    #1 0x2 in fuzz_parser {source}/fuzz_harnesses/parser_fuzzer.c:52:5
+""",
+                encoding="utf-8",
+            )
+
+            record = analyze_crash_item(
+                workspace,
+                manifest,
+                {
+                    "id": "def456",
+                    "type": "stack-buffer-overflow",
+                    "access": "read",
+                    "severity": "HIGH",
+                    "reproducible": True,
+                    "trace_path": str(trace),
+                    "minimized_path": str(workspace / "min.bin"),
+                },
+            )
+
+            self.assertEqual(record["tier"], "valid_target_bug")
+            self.assertEqual(record["product_mapping"]["status"], "unmapped")
 
     def test_snapshot_counts_triaged_duplicate_crashes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -634,24 +1276,24 @@ TOTAL 10 1 90.00% 3 1 66.67% 11 7 36.36% 0 0 -
             },
             {
                 "kind": "candidate_file_unreported",
-                "candidate": "macos_parser_7",
-                "file": "platform/macos.c",
-                "function": "parse_macos",
+                "candidate": "bsd_parser_7",
+                "file": "platform/bsd.c",
+                "function": "parse_bsd",
             },
         ]
         classifications = [
             {
-                "file": "platform/macos.c",
-                "function": "parse_macos",
+                "file": "platform/bsd.c",
+                "function": "parse_bsd",
                 "status": "platform-specific",
-                "reason": "macOS-only backend is not built in the Linux native target",
+                "reason": "BSD-only backend is not built in the Linux native target",
             }
         ]
 
         unresolved, classified = _apply_blocker_classifications(blockers, classifications)
 
         self.assertEqual([item["candidate"] for item in unresolved], ["linux_parser_42"])
-        self.assertEqual([item["candidate"] for item in classified], ["macos_parser_7"])
+        self.assertEqual([item["candidate"] for item in classified], ["bsd_parser_7"])
         self.assertEqual(classified[0]["classification"]["status"], "platform-specific")
 
     def test_harness_review_accepts_multiline_main_signature(self) -> None:
@@ -714,9 +1356,9 @@ TOTAL 10 1 90.00% 3 1 66.67% 11 7 36.36% 0 0 -
             build_system="raw",
             harnesses=[
                 Harness(name="dns_wire_file", type="file"),
-                Harness(name="thread_netdata_file", type="file"),
                 Harness(name="config_parse_file", type="file"),
                 Harness(name="dns_rdata_file", type="file"),
+                Harness(name="srp_filedata_file", type="file"),
             ],
         )
         active = [

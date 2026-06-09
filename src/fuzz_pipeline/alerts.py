@@ -5,6 +5,7 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .util import FuzzCtlError
@@ -30,7 +31,30 @@ COLORS = {
 
 
 def webhook_url(explicit: str | None = None) -> str | None:
-    return explicit or os.environ.get("DISCORD_WEBHOOK_URL")
+    return _clean_env_value(explicit) or _clean_env_value(os.environ.get("DISCORD_WEBHOOK_URL")) or _env_file_value("DISCORD_WEBHOOK_URL")
+
+
+def _clean_env_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
+        cleaned = cleaned[1:-1].strip()
+    return cleaned or None
+
+
+def _env_file_value(name: str) -> str | None:
+    path = Path.home() / ".config" / "fuzz-pipeline" / "env"
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key == name:
+            return _clean_env_value(value)
+    return None
 
 
 def send_discord(event: AlertEvent, *, url: str | None = None, dry_run: bool = False) -> bool:
@@ -83,4 +107,3 @@ def test_alert(*, url: str | None = None, dry_run: bool = False) -> bool:
         url=url,
         dry_run=dry_run
     )
-

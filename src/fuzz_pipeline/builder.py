@@ -22,6 +22,10 @@ def harness_binary(workspace: Path, manifest: TargetManifest, profile: str, harn
 def _compiler_for(profile: str, language: str, source: Path) -> str:
     suffix = source.suffix.lower()
     is_cpp = suffix in {".cc", ".cpp", ".cxx"} or (language == "c++" and suffix != ".c")
+    if profile == "symcc":
+        return "sym++" if is_cpp else "symcc"
+    if profile == "fuzztest_asan_ubsan":
+        return "clang++"
     if profile == "afl_asan_ubsan":
         return "afl-clang-fast++" if is_cpp else "afl-clang-fast"
     if profile == "afl_lto_cmplog":
@@ -34,6 +38,17 @@ def _profile_flags(profile: str, harness: Harness) -> list[str]:
         return [*COMMON_FLAGS, "-DFUZZ_STANDALONE", "-fsanitize=address,undefined"]
     if profile == "libfuzzer_asan_ubsan":
         return [*COMMON_FLAGS, "-DFUZZ_LIBFUZZER", "-fsanitize=fuzzer,address,undefined"]
+    if profile == "fuzztest_asan_ubsan":
+        return [
+            *COMMON_FLAGS,
+            "-DFUZZ_FUZZTEST",
+            "-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION",
+            "-fsanitize=address,undefined",
+            "-fsanitize-coverage=inline-8bit-counters",
+            "-fsanitize-coverage=trace-cmp",
+        ]
+    if profile == "symcc":
+        return [*COMMON_FLAGS, "-DFUZZ_STANDALONE"]
     if profile == "coverage":
         return [
             "-g",
@@ -57,6 +72,10 @@ def _profile_env(profile: str) -> dict[str, str]:
         env.update({"AFL_USE_ASAN": "1", "AFL_USE_UBSAN": "1", "AFL_SKIP_CPUFREQ": "1"})
     if profile == "afl_lto_cmplog":
         env["AFL_LLVM_CMPLOG"] = "1"
+    if profile == "symcc":
+        env.pop("ASAN_OPTIONS", None)
+        env.pop("UBSAN_OPTIONS", None)
+        env["SYMCC_REGULAR_LIBCXX"] = "1"
     return env
 
 
@@ -91,10 +110,15 @@ def _build_raw_harnesses(workspace: Path, manifest: TargetManifest, profile: str
     artifacts: list[dict[str, str]] = []
     for harness in manifest.harnesses:
         if harness.profiles and profile not in harness.profiles:
+            if not (profile == "symcc" and harness.type in {"file", "stdin"} and "afl_asan_ubsan" in harness.profiles):
+                continue
+        if profile == "symcc" and harness.type not in {"file", "stdin"}:
             continue
         if profile == "libfuzzer_asan_ubsan" and harness.type != "libfuzzer":
             continue
-        if profile != "libfuzzer_asan_ubsan" and harness.type == "libfuzzer":
+        if profile == "fuzztest_asan_ubsan" and harness.type != "fuzztest":
+            continue
+        if profile not in {"libfuzzer_asan_ubsan", "fuzztest_asan_ubsan"} and harness.type in {"libfuzzer", "fuzztest"}:
             continue
         if not harness.source:
             continue
@@ -135,8 +159,12 @@ def _build_project_system(workspace: Path, manifest: TargetManifest, profile: st
     source_dir = manifest.source_dir(workspace)
     out_dir = ensure_dir(build_root(workspace, manifest, profile))
     env = _profile_env(profile)
-    compiler_c = "afl-clang-fast" if profile.startswith("afl") else "clang"
-    compiler_cxx = "afl-clang-fast++" if profile.startswith("afl") else "clang++"
+    if profile == "symcc":
+        compiler_c = "symcc"
+        compiler_cxx = "sym++"
+    else:
+        compiler_c = "afl-clang-fast" if profile.startswith("afl") else "clang"
+        compiler_cxx = "afl-clang-fast++" if profile.startswith("afl") else "clang++"
     flags = " ".join(_profile_flags(profile, Harness(name="project", type="file")))
     env.update({"CC": compiler_c, "CXX": compiler_cxx, "CFLAGS": flags, "CXXFLAGS": flags, "LDFLAGS": flags})
     if manifest.build_system == "cmake":
@@ -164,6 +192,11 @@ def build_profile(workspace: Path, manifest: TargetManifest, profile: str) -> Pa
         artifacts = _run_custom_commands(workspace, manifest, profile, manifest.build_commands[profile])
     else:
         artifacts = _build_raw_harnesses(workspace, manifest, profile)
+        if profile == "fuzztest_asan_ubsan" and not artifacts:
+            raise FuzzCtlError(
+                "no FuzzTest harness artifacts built; add a harness with type 'fuzztest' "
+                "and profile 'fuzztest_asan_ubsan', or provide build_commands for this profile"
+            )
         if not artifacts:
             artifacts = _build_project_system(workspace, manifest, profile)
     metadata = {

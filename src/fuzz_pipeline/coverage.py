@@ -123,6 +123,8 @@ def coverage_run(
         if not inputs:
             print(f"warning: no coverage inputs available for {harness.name}")
             continue
+        for stale in profraw.glob(f"{harness.name}-*.profraw"):
+            stale.unlink()
         for index, inp in enumerate(inputs):
             env = os.environ.copy()
             env["LLVM_PROFILE_FILE"] = str(profraw / f"{harness.name}-{index}-%p.profraw")
@@ -142,7 +144,8 @@ def coverage_run(
         html_dir = ensure_dir(out / f"{harness.name}.html")
         llvm_profdata = _llvm_tool("llvm-profdata")
         llvm_cov = _llvm_tool("llvm-cov")
-        run_cmd([llvm_profdata, "merge", "-sparse", "-o", str(profdata), *map(str, raw_files)], check=True, print_cmd=True)
+        print(f"merging coverage profiles for {harness.name}: {len(raw_files)} inputs")
+        run_cmd([llvm_profdata, "merge", "-sparse", "-o", str(profdata), *map(str, raw_files)], check=True)
         report = run_cmd([llvm_cov, "report", str(binary), f"-instr-profile={profdata}"], check=True, print_cmd=True)
         report_txt.write_text(report.output, encoding="utf-8", errors="replace")
         run_cmd(

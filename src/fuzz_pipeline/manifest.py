@@ -12,6 +12,8 @@ PROFILES = {
     "afl_asan_ubsan",
     "afl_lto_cmplog",
     "libfuzzer_asan_ubsan",
+    "fuzztest_asan_ubsan",
+    "symcc",
     "coverage",
 }
 
@@ -67,6 +69,7 @@ class TargetManifest:
     max_len: int = 4096
     timeout_ms: int = 1000
     memory_mb: int = 4096
+    afl_cmplog: bool = True
     harnesses: list[Harness] = field(default_factory=list)
     build_commands: dict[str, list[list[str]]] = field(default_factory=dict)
     build_context: dict[str, Any] = field(default_factory=dict)
@@ -86,6 +89,7 @@ class TargetManifest:
             max_len=int(data.get("max_len", 4096)),
             timeout_ms=int(data.get("timeout_ms", 1000)),
             memory_mb=int(data.get("memory_mb", 4096)),
+            afl_cmplog=bool(data.get("afl_cmplog", True)),
             harnesses=[Harness.from_dict(h) for h in data.get("harnesses", [])],
             build_commands={
                 str(k): [list(cmd) for cmd in v]
@@ -108,6 +112,7 @@ class TargetManifest:
             "max_len": self.max_len,
             "timeout_ms": self.timeout_ms,
             "memory_mb": self.memory_mb,
+            "afl_cmplog": self.afl_cmplog,
             "harnesses": [h.to_dict() for h in self.harnesses],
             "build_commands": self.build_commands,
             "build_context": self.build_context,

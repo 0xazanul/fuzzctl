@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import base64
-import re
 import shutil
 from pathlib import Path
 from typing import Any
 
 from .builder import build_profile, harness_binary
-from .campaign import _file_target_argv
+from .campaign_common import _file_target_argv
 from .manifest import Harness, TargetManifest
+from .triage_classification import access_kind, crash_type, severity as classify_severity, stack_state
 from .util import FuzzCtlError, ensure_dir, find_latest_run, read_json, rel_to, run_cmd, short_hash, write_json
 
 
-ASAN_RE = re.compile(r"ERROR: AddressSanitizer: ([a-zA-Z0-9_-]+)")
-LSAN_RE = re.compile(r"ERROR: LeakSanitizer: detected memory leaks")
-UBSAN_RE = re.compile(r"runtime error: ([^\n]+)")
-STACK_RE = re.compile(r"^\s*#\d+\s+0x[0-9a-fA-F]+\s+(?:in\s+)?(.+)$", re.MULTILINE)
+_access = access_kind
+_crash_type = crash_type
+_severity = classify_severity
+_stack_state = stack_state
 
 
 def _asan_env() -> dict[str, str]:
@@ -121,7 +121,7 @@ def _better_sanitizer_repro(
         binary = harness_binary(workspace, manifest, "libfuzzer_asan_ubsan", harness)
         return harness, binary, "libfuzzer_asan_ubsan", _repro_cmd(harness, binary, crash), result
 
-    ctype = _crash_type(result.output, result.returncode)
+    ctype = crash_type(result.output, result.returncode)
     if ctype != "unknown-crash" and result.output.strip():
         binary = harness_binary(workspace, manifest, "afl_asan_ubsan", harness)
         return harness, binary, "afl_asan_ubsan", _repro_cmd(harness, binary, crash), result
@@ -134,87 +134,12 @@ def _better_sanitizer_repro(
     twin_harness, twin_binary, twin_profile = twin
     cmd = _repro_cmd(twin_harness, twin_binary, crash)
     twin_result = run_cmd(cmd, cwd=manifest.source_dir(workspace), env=_asan_env(), timeout=max(5, manifest.timeout_ms // 1000 + 5))
-    twin_type = _crash_type(twin_result.output, twin_result.returncode)
+    twin_type = crash_type(twin_result.output, twin_result.returncode)
     if twin_result.returncode != 0 and (twin_type != "unknown-crash" or twin_result.output.strip()):
         return twin_harness, twin_binary, twin_profile, cmd, twin_result
 
     binary = harness_binary(workspace, manifest, "afl_asan_ubsan", harness)
     return harness, binary, "afl_asan_ubsan", _repro_cmd(harness, binary, crash), result
-
-
-def _crash_type(output: str, returncode: int) -> str:
-    m = ASAN_RE.search(output)
-    if m:
-        return m.group(1).lower()
-    if LSAN_RE.search(output):
-        return "memory-leak"
-    m = UBSAN_RE.search(output)
-    if m:
-        text = m.group(1).lower()
-        if "null pointer" in text or "null" in text:
-            return "null-pointer-undefined-behavior"
-        if "signed integer overflow" in text:
-            return "signed-integer-overflow"
-        return "undefined-behavior"
-    if "SEGV" in output or returncode in {-11, 139}:
-        return "segv"
-    if returncode == 124:
-        return "timeout"
-    return "unknown-crash"
-
-
-def _access(output: str) -> str:
-    if re.search(r"\bWRITE of size\b|\bWRITE memory access\b", output):
-        return "write"
-    if re.search(r"\bREAD of size\b|\bREAD memory access\b", output):
-        return "read"
-    return "unknown"
-
-
-def _severity(crash_type: str, access: str, output: str) -> tuple[str, str]:
-    crash_type = crash_type.lower()
-    critical = {
-        "heap-use-after-free",
-        "double-free",
-        "bad-free",
-        "attempting-free-on-address-which-was-not-malloc()-ed",
-        "alloc-dealloc-mismatch",
-    }
-    if crash_type in critical:
-        return "CRITICAL", "memory lifetime corruption with realistic exploitation potential"
-    if "buffer-overflow" in crash_type and access == "write":
-        return "CRITICAL", "attacker-controlled out-of-bounds write"
-    if crash_type in {"heap-use-after-free", "stack-use-after-return"} and access == "write":
-        return "CRITICAL", "attacker-controlled write through invalid lifetime"
-    if "buffer-overflow" in crash_type and access == "read":
-        return "HIGH", "out-of-bounds read may disclose memory or drive later corruption"
-    if "use-after" in crash_type:
-        return "HIGH", "use-after-free/read requires exploitability analysis"
-    if crash_type == "signed-integer-overflow" and re.search(r"alloc|malloc|calloc|realloc|new", output, re.I):
-        return "HIGH", "integer overflow appears near allocation or sizing logic"
-    if crash_type == "memory-leak":
-        return "LOW", "memory leak; security impact needs proof of attacker-amplified resource exhaustion"
-    if "null" in crash_type or crash_type == "segv":
-        return "MEDIUM", "crash/DoS by default; stronger impact needs boundary analysis"
-    if crash_type == "timeout":
-        return "MEDIUM", "potential denial of service through excessive processing"
-    return "LOW", "stability issue unless impact analysis proves memory safety risk"
-
-
-def _stack_state(output: str, crash_type: str) -> str:
-    frames = []
-    for match in STACK_RE.finditer(output):
-        frame = re.sub(r"\s+at\s+.*", "", match.group(1)).strip()
-        frame = re.sub(r"0x[0-9a-fA-F]+", "0xADDR", frame)
-        frames.append(frame)
-        if len(frames) == 3:
-            break
-    if not frames:
-        token = re.search(r"dedup_token:\s*([0-9a-fA-F]+)", output)
-        if token:
-            return f"{crash_type}:{token.group(1)}"
-        return crash_type
-    return crash_type + ":" + "|".join(frames)
 
 
 def _preserve_reproducer_metadata(item: dict[str, Any], previous: dict[str, Any] | None) -> None:
@@ -273,10 +198,10 @@ def triage_run(workspace: Path, manifest: TargetManifest, run_id: str | None = N
         result = run_cmd(cmd, cwd=manifest.source_dir(workspace), env=_asan_env(), timeout=max(5, manifest.timeout_ms // 1000 + 5))
         harness, binary, profile, cmd, result = _better_sanitizer_repro(workspace, manifest, harness, crash, result)
         output = result.output
-        ctype = _crash_type(output, result.returncode)
-        access = _access(output)
-        severity, impact = _severity(ctype, access, output)
-        state = _stack_state(output, ctype)
+        ctype = crash_type(output, result.returncode)
+        access = access_kind(output)
+        severity, impact = classify_severity(ctype, access, output)
+        state = stack_state(output, ctype)
         crash_id = short_hash(state)
         trace_path = traces / f"{crash_id}.txt"
         if not trace_path.exists() or trace_path.stat().st_size == 0:
